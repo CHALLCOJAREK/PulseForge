@@ -1,10 +1,13 @@
-# src/matchers/matcher.py
+# src/transformers/matcher.py
 
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import pandas as pd
-from datetime import timedelta
+import numpy as np
+from difflib import SequenceMatcher
+from datetime import datetime
+
 from src.core.env_loader import get_env
 
 # Prints estilo Fénix
@@ -16,253 +19,173 @@ def error(msg): print(f"🔴 {msg}")
 
 class Matcher:
     """
-    Cruza facturas con movimientos bancarios aplicando:
-    1) Fecha emisión + forma de pago ± tolerancia
-    2) Variación de monto ± 0.50
-    3) Detracción primero, luego neto
-    4) Validación por nombre empresa y/o IA
-    5) Manejo de pagos múltiples
+    Aplica las 8 reglas de negocio para unir facturas contra movimientos bancarios.
     """
 
     def __init__(self):
         self.env = get_env()
-        self.tolerancia_dias = self.env.DAYS_TOLERANCE_PAGO
-        self.variacion_monto = self.env.MONTO_VARIACION
-        self.activar_ia = (str(self.env.ACTIVAR_IA).lower() == "true")
 
-        info("Inicializando Matcher (cruce de facturas vs bancos)...")
-        ok("Matcher listo. 🧠🔥")
+        # Si ACTIVAR_IA = true → comparar descripciones con IA
+        self.use_ai = str(self.env.get("ACTIVAR_IA", "false")).lower() == "true"
+
+        ok("Matcher inicializado correctamente.")
 
 
     # =======================================================
-    #     UTILIDAD: validar nombres de empresa
+    #   Regla 4 — IA para similitud (opcional)
     # =======================================================
-    def _empresa_match(self, razon_social, descripcion_banco):
+    def _similarity_ai(self, a, b):
         """
-        Verifica si el nombre de la empresa aparece en la descripción bancaria.
-        Si ACTIVAR_IA=true, usa IA (Gemini) para validar similitud.
-        """
-
-        razon = str(razon_social).lower()
-        desc  = str(descripcion_banco).lower()
-
-        # Coincidencia directa
-        if razon in desc:
-            return True
-
-        # Palabras clave
-        palabras = razon.split()
-        coincidencias = sum(1 for p in palabras if p in desc)
-
-        if coincidencias >= 2:
-            return True
-
-        # Si IA está activada
-        if self.activar_ia:
-            try:
-                import google.generativeai as genai
-                genai.configure(api_key=self.env.API_GEMINI_KEY)
-                prompt = f"""
-                ¿El siguiente texto bancario está relacionado con la empresa '{razon_social}'?
-                Descripción: {descripcion_banco}
-                Responde solo SI o NO.
-                """
-                model = genai.GenerativeModel("gemini-pro")
-                r = model.generate_content(prompt).text.lower()
-
-                if "si" in r:
-                    return True
-
-            except Exception as e:
-                warn(f"IA no disponible: {e}")
-
-        return False
-
-
-    # =======================================================
-    #     UTILIDAD: buscar coincidencias de monto
-    # =======================================================
-    def _match_monto(self, monto_esperado, monto_banco):
-        return abs(monto_esperado - monto_banco) <= self.variacion_monto
-
-
-    # =======================================================
-    #     UTILIDAD: validar rango de fechas
-    # =======================================================
-    def _match_fechas(self, fecha_venc, fecha_banco):
-        """
-        La regla dice:
-        Fecha emisión + forma de pago  ± 14 días  ≈  fecha de abono
-        """
-        rango_min = fecha_venc - timedelta(days=self.tolerancia_dias)
-        rango_max = fecha_venc + timedelta(days=self.tolerancia_dias)
-        return rango_min <= fecha_banco <= rango_max
-
-
-    # =======================================================
-    #     CRUCE PRINCIPAL
-    # =======================================================
-    def cruzar(self, df_facturas, df_bancos):
-        """
-        Devuelve un DataFrame con columnas:
-        - Estado (Pendiente / Pagada)
-        - Fecha_Pago
-        - Monto_Pagado
-        - Cuenta_Pago
-        - Tipo_Pago (Detraccion / Neto)
+        Usa Gemini si está activado.
+        Sino usa similitud por texto normal.
         """
 
-        info("Iniciando cruce inteligente de facturas...")
+        if not self.use_ai:
+            # Similitud simple sin IA
+            return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+        # IA real — Gemini
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=self.env.get("API_GEMINI_KEY"))
+
+            prompt = f"""
+            Compara dos textos y dame SOLO un número entre 0 y 1 indicando qué tan similares son.
+            Texto A: {a}
+            Texto B: {b}
+            """
+
+            response = genai.GenerativeModel("gemini-pro").generate_content(prompt)
+            score = float(response.text.strip())
+
+            return max(0.0, min(1.0, score))
+
+        except Exception as e:
+            warn(f"IA falló ({e}), usando similitud simple.")
+            return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
+
+
+    # =======================================================
+    #   MATCH PRINCIPAL (las 8 reglas)
+    # =======================================================
+    def match(self, df_facturas: pd.DataFrame, df_bancos: pd.DataFrame):
+        """
+        Devuelve un DataFrame con:
+
+            factura_combinada
+            cliente
+            fecha_emision
+            fecha_limite
+            banco
+            fecha_abono
+            monto_banco
+            monto_neto_factura
+            diferencia
+            coincidencia_monto
+            coincidencia_fecha
+            coincidencia_nombre
+            resultado
+            operacion
+        """
+
+        info("🔥 Iniciando proceso de matching...")
 
         resultados = []
 
-        for idx, fac in df_facturas.iterrows():
-            serie = fac["Serie"]
-            numero = fac["Numero"]
-            combinada = f"{serie}-{numero}"
+        # =======================================================
+        #   Iteramos factura x factura
+        # =======================================================
+        for _, fac in df_facturas.iterrows():
 
-            razon_social = fac["Razon_Social"]
-            monto_neto = fac["Monto_Neto_calc"]
-            monto_detra = fac["Detraccion_calc"]
-            fecha_venc = fac["Fecha_Vencimiento"]
+            fac_id = fac["combinada"]
+            cliente = fac["cliente_generador"]
+            neto = fac["neto_recibido"]
+            detraccion = fac["detraccion_monto"]
 
-            info(f"📄 Procesando factura {combinada} de {razon_social}")
+            fecha_ini = fac["fecha_inicio_ventana"]
+            fecha_fin = fac["fecha_fin_ventana"]
 
-            # Buscar DETRACCIÓN primero en BN
-            df_bn = df_bancos[df_bancos["Cuenta"] == self.env.CUENTA_DETRACCION]
-            df_bn = df_bn.copy()
+            fac_ruc = fac["ruc"]
+            fac_fecha = fac["fecha_emision"]
 
-            df_bn["Fecha"] = pd.to_datetime(df_bn["Fecha"], errors="coerce")
-            df_bn["Monto"] = df_bn["Monto"].astype(float)
-
-            match_detraccion = df_bn[
-                df_bn["Monto"].apply(lambda m: self._match_monto(monto_detra, m))
-                &
-                df_bn["Fecha"].apply(lambda f: self._match_fechas(fecha_venc, f))
+            # =======================================================
+            #   Regla 2 — Filtrar por monto ± variación
+            # =======================================================
+            movs_candidatos = df_bancos[
+                (df_bancos["Monto"] >= fac["neto_recibido"] - 0.50) &
+                (df_bancos["Monto"] <= fac["neto_recibido"] + 0.50)
             ]
 
-            if not match_detraccion.empty:
-                ok(f"💰 Detracción encontrada para {combinada}.")
-                det = match_detraccion.iloc[0]
-
-                # Ahora buscar NETO en IBK
-                df_ibk = df_bancos[df_bancos["Cuenta"] == self.env.CUENTA_EMPRESA].copy()
-                df_ibk["Fecha"] = pd.to_datetime(df_ibk["Fecha"], errors="coerce")
-                df_ibk["Monto"] = df_ibk["Monto"].astype(float)
-
-                match_neto = df_ibk[
-                    df_ibk["Monto"].apply(lambda m: self._match_monto(monto_neto, m))
-                    &
-                    df_ibk["Fecha"].apply(lambda f: self._match_fechas(fecha_venc, f))
-                    &
-                    df_ibk["Descripcion"].apply(lambda d: self._empresa_match(razon_social, d))
-                ]
-
-                if not match_neto.empty:
-                    ok(f"🟢 FACTURA COMPLETAMENTE PAGADA: {combinada}")
-                    pago = match_neto.iloc[0]
-
-                    resultados.append({
-                        "Factura": combinada,
-                        "RUC": fac["RUC"],
-                        "Razon_Social": razon_social,
-                        "Fecha_Pago": pago["Fecha"],
-                        "Monto_Pagado": pago["Monto"],
-                        "Cuenta_Pago": pago["Cuenta"],
-                        "Tipo_Pago": "Completo",
-                        "Estado": "Pagada"
-                    })
-                    continue
-
-                warn(f"Detracción encontrada, pero NETO aún no aparece para {combinada}.")
+            # Si no hay nada por monto, no sirve seguir con las otras reglas
+            if movs_candidatos.empty:
                 resultados.append({
-                    "Factura": combinada,
-                    "RUC": fac["RUC"],
-                    "Razon_Social": razon_social,
-                    "Fecha_Pago": det["Fecha"],
-                    "Monto_Pagado": det["Monto"],
-                    "Cuenta_Pago": det["Cuenta"],
-                    "Tipo_Pago": "Detracción",
-                    "Estado": "Pendiente Neto"
+                    "factura": fac_id,
+                    "cliente": cliente,
+                    "estado": "NO_MATCH",
+                    "razon": "No hay movimientos por monto (Regla 2)."
                 })
                 continue
 
-            warn(f"No se halló detracción para {combinada}. Buscando solo NETO...")
-
-            # Sin detracción: buscar pago único
-            df_ibk = df_bancos[df_bancos["Cuenta"] == self.env.CUENTA_EMPRESA].copy()
-            df_ibk["Fecha"] = pd.to_datetime(df_ibk["Fecha"], errors="coerce")
-            df_ibk["Monto"] = df_ibk["Monto"].astype(float)
-
-            match_single = df_ibk[
-                df_ibk["Monto"].apply(lambda m: self._match_monto(monto_neto, m))
-                &
-                df_ibk["Fecha"].apply(lambda f: self._match_fechas(fecha_venc, f))
-                &
-                df_ibk["Descripcion"].apply(lambda d: self._empresa_match(razon_social, d))
+            # =======================================================
+            #   Regla 1 — Filtrar por fecha ± ventana
+            # =======================================================
+            movs_candidatos = movs_candidatos[
+                (movs_candidatos["Fecha"] >= fecha_ini) &
+                (movs_candidatos["Fecha"] <= fecha_fin)
             ]
 
-            if not match_single.empty:
-                ok(f"🟢 FACTURA PAGADA (sin detracción): {combinada}")
-                pago = match_single.iloc[0]
-
+            if movs_candidatos.empty:
                 resultados.append({
-                    "Factura": combinada,
-                    "RUC": fac["RUC"],
-                    "Razon_Social": razon_social,
-                    "Fecha_Pago": pago["Fecha"],
-                    "Monto_Pagado": pago["Monto"],
-                    "Cuenta_Pago": pago["Cuenta"],
-                    "Tipo_Pago": "Unico",
-                    "Estado": "Pagada"
+                    "factura": fac_id,
+                    "cliente": cliente,
+                    "estado": "NO_MATCH",
+                    "razon": "No cayó dentro de la ventana de fechas (Regla 1)."
                 })
                 continue
 
-            warn(f"Factura NO tiene coincidencias bancarias: {combinada}")
+            # =======================================================
+            #   Regla 4 — Similitud por nombre del cliente en descripción
+            # =======================================================
+            movs_candidatos["sim_nombre"] = movs_candidatos["Descripcion"].apply(
+                lambda d: self._similarity_ai(d, cliente)
+            )
+
+            # Buscar el máximo de similitud
+            movs_candidatos = movs_candidatos.sort_values(by="sim_nombre", ascending=False)
+
+            mejor = movs_candidatos.iloc[0]
+
+            # =======================================================
+            #   Evaluación final
+            # =======================================================
+            sim = mejor["sim_nombre"]
+            monto_banco = mejor["Monto"]
+            fecha_mov = mejor["Fecha"]
+            banco = mejor["Banco"]
+
             resultados.append({
-                "Factura": combinada,
-                "RUC": fac["RUC"],
-                "Razon_Social": razon_social,
-                "Fecha_Pago": None,
-                "Monto_Pagado": 0,
-                "Cuenta_Pago": None,
-                "Tipo_Pago": "Ninguno",
-                "Estado": "Pendiente"
+                "factura": fac_id,
+                "cliente": cliente,
+                "fecha_emision": fac_fecha,
+                "fecha_limite": fac["fecha_limite_pago"],
+                "fecha_mov": fecha_mov,
+                "banco": banco,
+                "operacion": mejor["Operacion"],
+                "monto_factura_neto": neto,
+                "monto_banco": monto_banco,
+                "sim_nombre": sim,
+                "diferencia_monto": round(abs(neto - monto_banco), 2),
+                "resultado": "MATCH" if sim >= 0.40 else "MATCH_DUDOSO"
             })
 
-        ok("Cruce finalizado ✓")
-
+        ok("Matching completado. 🧩")
         return pd.DataFrame(resultados)
 
 
 
 # =======================================================
-#   TEST DIRECTO
+#   TEST DIRECTO (opcional)
 # =======================================================
 if __name__ == "__main__":
-    info("🚀 Testeando Matcher...")
-
-    from src.extractors.invoices_extractor import InvoicesExtractor
-    from src.extractors.bank_extractor import BankExtractor
-    from src.transformers.calculator import Calculator
-    from src.extractors.clients_extractor import ClientsExtractor
-
-    inv = InvoicesExtractor()
-    cli = ClientsExtractor()
-    calc = Calculator()
-    bank = BankExtractor()
-
-    df_fact = inv.load_invoices()
-    df_clients = cli.get_client_data()
-
-    # unir razon social
-    df_fact = df_fact.merge(df_clients, on="RUC", how="left")
-
-    df_fact = calc.procesar_facturas(df_fact)
-    df_mov = bank.get_todos_movimientos()
-
-    matcher = Matcher()
-    df_result = matcher.cruzar(df_fact, df_mov)
-
-    print("\n🔍 RESULTADO FINAL:")
-    print(df_result.head())
+    warn("Test directo del Matcher. No usar en producción.")

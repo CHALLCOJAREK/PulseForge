@@ -3,124 +3,109 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-from datetime import datetime
-
-# Core
-from src.core.env_loader import get_env
-from src.loaders.newdb_builder import NewDBBuilder
-
-# Extractors
-from src.extractors.invoices_extractor import InvoicesExtractor
+# ========== EXTRACTORS ==========
 from src.extractors.clients_extractor import ClientsExtractor
+from src.extractors.invoices_extractor import InvoicesExtractor
 from src.extractors.bank_extractor import BankExtractor
 
-# Transformers
+# ========== TRANSFORMERS ==========
+from src.transformers.data_mapper import DataMapper
 from src.transformers.calculator import Calculator
+from src.transformers.matcher import Matcher
 
-# Matcher
-from src.matchers.matcher import Matcher
-
-# Writers
+# ========== LOADERS ==========
+from src.loaders.newdb_builder import NewDBBuilder
 from src.loaders.invoice_writer import InvoiceWriter
 from src.loaders.match_writer import MatchWriter
 
-# Prints Fénix
+# ========== UTILS ==========
+from src.core.env_loader import get_env
+
+# Prints estilo Fénix
 def info(msg): print(f"🔵 {msg}")
 def ok(msg): print(f"🟢 {msg}")
 def warn(msg): print(f"🟡 {msg}")
 def error(msg): print(f"🔴 {msg}")
 
 
+# =======================================================
+#   FULL RUN: EJECUCIÓN COMPLETA DEL SISTEMA
+# =======================================================
 def full_run():
-    info("🔥 Iniciando ejecución completa de PulseForge...")
-    start_time = datetime.now()
+    info("🚀 Iniciando ejecución completa de PulseForge...")
 
-    # ======================================================
-    # 1) Cargar env
-    # ======================================================
     env = get_env()
-    ok("Variables de entorno cargadas ✓")
 
-    # ======================================================
-    # 2) Construir nueva BD
-    # ======================================================
-    builder = NewDBBuilder()
-    builder.build()
+    # 1) EXTRACTION
+    info("📥 Extrayendo clientes...")
+    clientes_df = ClientsExtractor().get_client_data()
 
-    # ======================================================
-    # 3) Extraer facturas
-    # ======================================================
-    inv = InvoicesExtractor()
-    df_facturas = inv.load_invoices()
-    ok(f"Facturas extraídas: {len(df_facturas)}")
+    info("📥 Extrayendo facturas...")
+    facturas_df = InvoicesExtractor().load_invoices()
 
-    # ======================================================
-    # 4) Extraer clientes (razón social)
-    # ======================================================
-    cli = ClientsExtractor()
-    df_clientes = cli.get_client_data()
-    ok(f"Clientes extraídos: {len(df_clientes)}")
+    info("📥 Extrayendo movimientos bancarios...")
+    bancos_df = BankExtractor().get_todos_movimientos()
 
-    # ======================================================
-    # 5) Unir facturas + clientes
-    # ======================================================
-    info("Uniendo facturas con razón social...")
-    df_facturas = df_facturas.merge(df_clientes, on="RUC", how="left")
-    ok("Unión completada ✓")
+    # 2) MAPPING
+    mapper = DataMapper()
 
-    # ======================================================
-    # 6) Calcular subtotales, IGV, neto, detracción, vencimiento
-    # ======================================================
+    info("🔄 Mapeando clientes...")
+    clientes_m = mapper.map_clientes(clientes_df)
+
+    info("🔄 Mapeando facturas...")
+    facturas_m = mapper.map_facturas(facturas_df)
+
+    info("🔄 Mapeando movimientos bancarios...")
+    bancos_m = mapper.map_bancos(bancos_df)
+
+    # 3) CALCULATOR
+    info("🧮 Ejecutando cálculos financieros...")
     calc = Calculator()
-    df_calc = calc.procesar_facturas(df_facturas)
-    ok("Cálculos contables aplicados ✓")
+    facturas_calc = calc.process_facturas(facturas_m)
+    bancos_calc   = calc.process_bancos(bancos_m)
 
-    # ======================================================
-    # 7) Guardar facturas procesadas
-    # ======================================================
-    writer_inv = InvoiceWriter()
-    writer_inv.guardar_facturas(df_calc)
-    writer_inv.close()
-
-    # ======================================================
-    # 8) Extraer movimientos bancarios
-    # ======================================================
-    bank = BankExtractor()
-    df_bancos = bank.get_todos_movimientos()
-    ok(f"Movimientos bancarios cargados: {len(df_bancos)}")
-
-    # ======================================================
-    # 9) Aplicar matcher
-    # ======================================================
+    # 4) MATCHER
+    info("🧩 Iniciando matching completo...")
     matcher = Matcher()
-    df_match = matcher.cruzar(df_calc, df_bancos)
-    ok("Cruce bancario completado ✓")
+    matches_df = matcher.match(facturas_calc, bancos_calc)
 
-    # ======================================================
-    # 10) Guardar resultados del matcher
-    # ======================================================
-    writer_match = MatchWriter()
-    writer_match.guardar_matches(df_match)
-    writer_match.close()
+    # 5) NEW DB BUILDER
+    info("🏗️ Construyendo BD destino (PulseForge)...")
+    builder = NewDBBuilder()
+    builder.crear_tablas()
 
-    # ======================================================
-    # 11) Log final del proceso
-    # ======================================================
-    builder.write_log("Ejecución FullRun", f"Procesadas {len(df_calc)} facturas.")
+    # 6) WRITERS
+    invoice_writer = InvoiceWriter()
+    match_writer   = MatchWriter()
 
-    # ======================================================
-    # 12) Tiempo final
-    # ======================================================
-    end_time = datetime.now()
-    duracion = (end_time - start_time).total_seconds()
+    info("🧹 Limpiando tablas destino para carga FULL...")
+    invoice_writer.limpiar_tabla()
+    match_writer.limpiar_tabla()
 
-    ok("🔥 PulseForge – FULL RUN COMPLETADO 🔥")
-    info(f"🕒 Duración total: {duracion} segundos")
-    info("✔ Sistema listo, datos actualizados en BD nueva.")
+    info("📤 Insertando facturas en pulseforge.sqlite...")
+    invoice_writer.escribir_facturas(facturas_calc)
+
+    info("📤 Insertando matches en pulseforge.sqlite...")
+    match_writer.escribir_matches(matches_df)
+
+    # 7) RESUMEN FINAL
+    ok("🎯 Full Run completado con éxito.")
+    print("\n================ RESULTADO FINAL ================\n")
+    print(f"Facturas procesadas: {len(facturas_calc)}")
+    print(f"Movimientos bancarios leídos: {len(bancos_calc)}")
+    print(f"Matches generados: {len(matches_df)}")
+    print("\n================================================\n")
+
+    return {
+        "facturas": facturas_calc,
+        "bancos": bancos_calc,
+        "matches": matches_df
+    }
 
 
-# ======================================================
-#   EJECUCIÓN DIRECTA
-# ======================================================
+
+# =======================================================
+#   TEST DIRECTO
+# =======================================================
 if __name__ == "__main__":
     full_run()

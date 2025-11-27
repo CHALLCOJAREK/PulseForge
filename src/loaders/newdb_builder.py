@@ -3,8 +3,7 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-import sqlite3
-from datetime import datetime
+from sqlalchemy import create_engine, text
 from src.core.env_loader import get_env
 
 # Prints estilo Fénix
@@ -16,148 +15,112 @@ def error(msg): print(f"🔴 {msg}")
 
 class NewDBBuilder:
     """
-    Construye la BD nueva de PulseForge.
-    Crea tablas:
-      - facturas_procesadas
-      - match_results
-      - logs (auditoría interna)
+    Crea la base de datos destino pulseforge.sqlite
+    con las tablas estándar del sistema.
     """
 
     def __init__(self):
         self.env = get_env()
-        self.db_path = self.env.PULSEFORGE_NEWDB_PATH
+        self.db_path = self.env.get("PULSEFORGE_NEWDB_PATH")
 
-        info(f"Iniciando creación/verificación de nueva BD en:")
-        info(f"{self.db_path}")
+        if not self.db_path:
+            error("No hay ruta a la BD destino en .env (PULSEFORGE_NEWDB_PATH).")
+            raise ValueError("BD destino no definida")
 
-        # Crear carpeta si no existe
-        db_dir = os.path.dirname(self.db_path)
-        if not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-            ok(f"Carpeta creada: {db_dir}")
+        self.engine = create_engine(f"sqlite:///{self.db_path}")
 
-        self.conn = sqlite3.connect(self.db_path)
-        self.cursor = self.conn.cursor()
+        info("Iniciando constructor de nueva BD PulseForge...")
 
-        ok("Conectado a la BD destino.")
+    # =========================================================
+    #   Crear tablas base
+    # =========================================================
+    def crear_tablas(self):
+        info("Creando tablas pulseforge...")
 
+        tablas_sql = [
 
-    # =======================================================
-    #     CREAR TABLA facturas_procesadas
-    # =======================================================
-    def create_table_facturas(self):
-        info("Creando/verificando tabla: facturas_procesadas...")
+            # ------------------- CLIENTES -------------------
+            """
+            CREATE TABLE IF NOT EXISTS clientes_pf (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ruc TEXT,
+                razon_social TEXT
+            );
+            """,
 
-        self.cursor.execute("""
-        CREATE TABLE IF NOT EXISTS facturas_procesadas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Factura TEXT UNIQUE,
-            RUC TEXT,
-            Razon_Social TEXT,
-            Subtotal REAL,
-            IGV REAL,
-            Total REAL,
-            Detraccion REAL,
-            Monto_Neto REAL,
-            Fecha_Emision TEXT,
-            Fecha_Vencimiento TEXT,
-            Fecha_Registro TEXT
-        )
-        """)
+            # ------------------- FACTURAS -------------------
+            """
+            CREATE TABLE IF NOT EXISTS facturas_pf (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                combinada TEXT,
+                ruc TEXT,
+                cliente_generador TEXT,
+                subtotal REAL,
+                igv REAL,
+                total_con_igv REAL,
+                detraccion REAL,
+                neto_recibido REAL,
+                fecha_emision TEXT,
+                forma_pago INTEGER,
+                fecha_limite_pago TEXT,
+                fecha_inicio_ventana TEXT,
+                fecha_fin_ventana TEXT,
+                estado_fs TEXT,
+                estado_cont TEXT
+            );
+            """,
 
-        ok("Tabla facturas_procesadas OK ✓")
+            # ------------------- BANCOS -------------------
+            """
+            CREATE TABLE IF NOT EXISTS bancos_pf (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                banco TEXT,
+                fecha_mov TEXT,
+                tipo_mov TEXT,
+                descripcion TEXT,
+                serie TEXT,
+                numero TEXT,
+                monto REAL,
+                moneda TEXT,
+                operacion TEXT,
+                destinatario TEXT,
+                tipo_documento TEXT
+            );
+            """,
 
+            # ------------------- MATCHES -------------------
+            """
+            CREATE TABLE IF NOT EXISTS matches_pf (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                factura TEXT,
+                cliente TEXT,
+                fecha_emision TEXT,
+                fecha_limite TEXT,
+                fecha_mov TEXT,
+                banco TEXT,
+                operacion TEXT,
+                monto_factura REAL,
+                monto_banco REAL,
+                diferencia_monto REAL,
+                similitud REAL,
+                resultado TEXT
+            );
+            """
+        ]
 
-    # =======================================================
-    #     CREAR TABLA match_results
-    # =======================================================
-    def create_table_match(self):
-        info("Creando/verificando tabla: match_results...")
+        with self.engine.connect() as conn:
+            for sql in tablas_sql:
+                conn.execute(text(sql))
 
-        self.cursor.execute("""
-        CREATE TABLE IF NOT EXISTS match_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Factura TEXT UNIQUE,
-            RUC TEXT,
-            Razon_Social TEXT,
-            Fecha_Pago TEXT,
-            Monto_Pagado REAL,
-            Cuenta_Pago TEXT,
-            Tipo_Pago TEXT,
-            Estado TEXT,
-            Fecha_Registro TEXT
-        )
-        """)
-
-        ok("Tabla match_results OK ✓")
-
-
-    # =======================================================
-    #     CREAR TABLA logs
-    # =======================================================
-    def create_table_logs(self):
-        info("Creando/verificando tabla: logs...")
-
-        self.cursor.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            evento TEXT,
-            detalle TEXT
-        )
-        """)
-
-        ok("Tabla logs OK ✓")
-
-
-    # =======================================================
-    #     GUARDAR LOG
-    # =======================================================
-    def write_log(self, evento, detalle=""):
-        """
-        Guarda log en la BD Y en archivo .log externo
-        """
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Guardar en SQLite
-        self.cursor.execute(
-            "INSERT INTO logs (timestamp, evento, detalle) VALUES (?, ?, ?)",
-            (ts, evento, detalle)
-        )
-        self.conn.commit()
-
-        # Log externo
-        logs_dir = os.path.join(os.path.dirname(self.db_path), "logs")
-        if not os.path.exists(logs_dir):
-            os.makedirs(logs_dir)
-
-        log_file = os.path.join(logs_dir, f"{datetime.now().strftime('%Y-%m-%d')}.log")
-
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(f"[{ts}] {evento} — {detalle}\n")
-
-        ok(f"Log escrito: {evento}")
+        ok("Tablas creadas con éxito en pulseforge.sqlite 🚀")
 
 
-    # =======================================================
-    #     CONSTRUIR TODAS LAS TABLAS
-    # =======================================================
-    def build(self):
-        info("Construyendo estructura completa de la BD nueva...")
 
-        self.create_table_facturas()
-        self.create_table_match()
-        self.create_table_logs()
-
-        self.write_log("BD Construida", "La estructura inicial fue creada correctamente.")
-
-        ok("PulseForge DB LISTA PARA TRABAJAR 🚀")
-
-
-# =======================================================
-#     TEST DIRECTO
-# =======================================================
+# ======================================================
+#   TEST DIRECTO (opcional)
+# ======================================================
 if __name__ == "__main__":
-    info("🚀 Testeando NewDBBuilder...")
+    info("🚀 Construyendo pulseforge.sqlite...")
     builder = NewDBBuilder()
-    builder.build()
+    builder.crear_tablas()
+    ok("BD PulseForge estructurada correctamente.")

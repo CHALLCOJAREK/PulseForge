@@ -3,9 +3,8 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-import sqlite3
-from datetime import datetime
 import pandas as pd
+from sqlalchemy import create_engine, text
 from src.core.env_loader import get_env
 
 # Prints estilo Fénix
@@ -17,216 +16,69 @@ def error(msg): print(f"🔴 {msg}")
 
 class InvoiceWriter:
     """
-    Escribe facturas procesadas en la BD nueva (pulseforge.sqlite),
-    de forma incremental (INSERT/UPDATE según corresponda).
+    Inserta facturas procesadas (mapper + calculator)
+    en la tabla facturas_pf de pulseforge.sqlite.
     """
 
     def __init__(self):
         self.env = get_env()
-        self.db_path = self.env.DB_PATH_NUEVA
 
-        info(f"Conectando a BD nueva para escribir facturas: {self.db_path}")
-        db_dir = os.path.dirname(self.db_path)
-        if not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-            ok(f"Carpeta creada para BD nueva: {db_dir}")
+        self.db_path = self.env.get("PULSEFORGE_NEWDB_PATH")
+        if not self.db_path:
+            error("No se encontró PULSEFORGE_NEWDB_PATH en .env.")
+            raise ValueError("Ruta de BD destino no definida.")
 
-        self.conn = sqlite3.connect(self.db_path)
-        self.cursor = self.conn.cursor()
-        ok("Conexión a BD nueva lista.")
+        self.engine = create_engine(f"sqlite:///{self.db_path}")
 
-    # ============================
-    # LOG
-    # ============================
-    def _write_log(self, evento, detalle=""):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ok("InvoiceWriter listo para escribir facturas procesadas.")
 
-        # En tabla logs (si existe)
+
+    # =======================================================
+    #   LIMPIAR TABLA (opcional)
+    # =======================================================
+    def limpiar_tabla(self):
+        """
+        Borra todo el contenido de facturas_pf.
+        Solo usar antes de una carga completa.
+        """
+        info("Limpiando tabla facturas_pf...")
+
+        sql = text("DELETE FROM facturas_pf;")
+
+        with self.engine.connect() as conn:
+            conn.execute(sql)
+
+        ok("Tabla facturas_pf limpiada.")
+
+
+    # =======================================================
+    #   INSERTAR FACTURAS
+    # =======================================================
+    def escribir_facturas(self, df_facturas: pd.DataFrame):
+        """
+        Inserta el DataFrame en facturas_pf.
+        df_facturas debe contener ya los cálculos del Calculator.
+        """
+
+        info(f"Insertando {len(df_facturas)} facturas en PulseForge...")
+
         try:
-            self.cursor.execute(
-                "INSERT INTO logs (timestamp, evento, detalle) VALUES (?, ?, ?)",
-                (ts, evento, detalle),
+            df_facturas.to_sql(
+                "facturas_pf",
+                con=self.engine,
+                if_exists="append",
+                index=False
             )
-            self.conn.commit()
         except Exception as e:
-            warn(f"No se pudo escribir log en tabla logs: {e}")
+            error(f"Error insertando facturas: {e}")
+            raise
 
-        # En archivo externo
-        logs_dir = os.path.join(os.path.dirname(self.db_path), "logs")
-        if not os.path.exists(logs_dir):
-            os.makedirs(logs_dir)
+        ok("Facturas insertadas correctamente en facturas_pf 🚀")
 
-        log_file = os.path.join(logs_dir, f"{datetime.now().strftime('%Y-%m-%d')}.log")
-        try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"[{ts}] {evento} — {detalle}\n")
-        except Exception as e:
-            warn(f"No se pudo escribir log en archivo: {e}")
-
-    # ============================
-    # UPSET (INSERT/UPDATE)
-    # ============================
-    def _factura_existe(self, factura_code: str) -> bool:
-        self.cursor.execute(
-            "SELECT 1 FROM facturas_procesadas WHERE Factura = ?",
-            (factura_code,),
-        )
-        return self.cursor.fetchone() is not None
-
-    def guardar_facturas(self, df: pd.DataFrame):
-        """
-        Espera un DataFrame que venga de Calculator,
-        con al menos estas columnas:
-
-        - Combinada
-        - RUC
-        - Razon_Social
-        - Subtotal_calc
-        - IGV_calc
-        - Total_calc
-        - Detraccion_calc
-        - Monto_Neto_calc
-        - Fecha_Emision_Parsed
-        - Fecha_Vencimiento
-        """
-        info("Escribiendo facturas procesadas en BD nueva (incremental)...")
-
-        requeridas = [
-            "Combinada",
-            "RUC",
-            "Razon_Social",
-            "Subtotal_calc",
-            "IGV_calc",
-            "Total_calc",
-            "Detraccion_calc",
-            "Monto_Neto_calc",
-            "Fecha_Emision_Parsed",
-            "Fecha_Vencimiento",
-        ]
-
-        faltantes = [c for c in requeridas if c not in df.columns]
-        if faltantes:
-            error(f"Faltan columnas en DataFrame para InvoiceWriter: {faltantes}")
-            raise KeyError(f"Columnas faltantes para InvoiceWriter: {faltantes}")
-
-        insertados = 0
-        actualizados = 0
-        fecha_registro = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        for _, row in df.iterrows():
-            factura_code = str(row["Combinada"])
-            ruc = str(row["RUC"])
-            razon = str(row["Razon_Social"]) if row["Razon_Social"] is not None else ""
-
-            subtotal = row["Subtotal_calc"]
-            igv = row["IGV_calc"]
-            total = row["Total_calc"]
-            detraccion = row["Detraccion_calc"]
-            neto = row["Monto_Neto_calc"]
-
-            fecha_emision = None
-            if pd.notnull(row["Fecha_Emision_Parsed"]):
-                fecha_emision = row["Fecha_Emision_Parsed"].strftime("%Y-%m-%d")
-
-            fecha_venc = None
-            if pd.notnull(row["Fecha_Vencimiento"]):
-                fecha_venc = row["Fecha_Vencimiento"].strftime("%Y-%m-%d")
-
-            if not self._factura_existe(factura_code):
-                # INSERT
-                self.cursor.execute(
-                    """
-                    INSERT INTO facturas_procesadas (
-                        Factura, RUC, Razon_Social,
-                        Subtotal, IGV, Total, Detraccion, Monto_Neto,
-                        Fecha_Emision, Fecha_Vencimiento, Fecha_Registro
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        factura_code,
-                        ruc,
-                        razon,
-                        subtotal,
-                        igv,
-                        total,
-                        detraccion,
-                        neto,
-                        fecha_emision,
-                        fecha_venc,
-                        fecha_registro,
-                    ),
-                )
-                insertados += 1
-                ok(f"Nueva factura insertada: {factura_code}")
-                self._write_log("Factura insertada", f"{factura_code}")
-            else:
-                # UPDATE
-                self.cursor.execute(
-                    """
-                    UPDATE facturas_procesadas
-                    SET RUC = ?,
-                        Razon_Social = ?,
-                        Subtotal = ?,
-                        IGV = ?,
-                        Total = ?,
-                        Detraccion = ?,
-                        Monto_Neto = ?,
-                        Fecha_Emision = ?,
-                        Fecha_Vencimiento = ?,
-                        Fecha_Registro = ?
-                    WHERE Factura = ?
-                    """,
-                    (
-                        ruc,
-                        razon,
-                        subtotal,
-                        igv,
-                        total,
-                        detraccion,
-                        neto,
-                        fecha_emision,
-                        fecha_venc,
-                        fecha_registro,
-                        factura_code,
-                    ),
-                )
-                actualizados += 1
-                warn(f"Factura actualizada: {factura_code}")
-                self._write_log("Factura actualizada", f"{factura_code}")
-
-        self.conn.commit()
-        ok(f"Facturas guardadas. Insertadas: {insertados}, Actualizadas: {actualizados}")
-
-    def close(self):
-        try:
-            self.conn.close()
-            ok("Conexión a BD nueva cerrada correctamente.")
-        except Exception as e:
-            warn(f"Error al cerrar conexión: {e}")
 
 
 # =======================================================
-#   TEST DIRECTO
+#   TEST DIRECTO (opcional)
 # =======================================================
 if __name__ == "__main__":
-    info("🚀 Testeando InvoiceWriter...")
-
-    from src.extractors.invoices_extractor import InvoicesExtractor
-    from src.extractors.clients_extractor import ClientsExtractor
-    from src.transformers.calculator import Calculator
-
-    inv = InvoicesExtractor()
-    cli = ClientsExtractor()
-    calc = Calculator()
-
-    df_fact = inv.load_invoices()
-    df_cli = cli.get_client_data()
-
-    # unir razon social
-    df_fact = df_fact.merge(df_cli, on="RUC", how="left")
-
-    df_calc = calc.procesar_facturas(df_fact)
-
-    writer = InvoiceWriter()
-    writer.guardar_facturas(df_calc)
-    writer.close()
+    warn("Test directo del InvoiceWriter. No usar en producción.")

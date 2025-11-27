@@ -3,9 +3,8 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
-import sqlite3
-from datetime import datetime
 import pandas as pd
+from sqlalchemy import create_engine, text
 from src.core.env_loader import get_env
 
 # Prints estilo Fénix
@@ -17,214 +16,78 @@ def error(msg): print(f"🔴 {msg}")
 
 class MatchWriter:
     """
-    Guarda los resultados del cruce bancario (matcher)
-    en la BD nueva, de manera incremental.
+    Inserta los resultados del Matcher en la tabla matches_pf.
     """
 
     def __init__(self):
         self.env = get_env()
-        self.db_path = self.env.DB_PATH_NUEVA
 
-        info(f"Conectando a BD nueva para escribir resultados de matcher: {self.db_path}")
+        self.db_path = self.env.get("PULSEFORGE_NEWDB_PATH")
+        if not self.db_path:
+            error("No se encontró PULSEFORGE_NEWDB_PATH en .env.")
+            raise ValueError("Ruta de BD destino no definida.")
 
-        db_dir = os.path.dirname(self.db_path)
-        if not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-            ok(f"Carpeta creada para BD nueva: {db_dir}")
+        self.engine = create_engine(f"sqlite:///{self.db_path}")
 
-        self.conn = sqlite3.connect(self.db_path)
-        self.cursor = self.conn.cursor()
-        ok("Conexión lista para match_writer.")
+        ok("MatchWriter listo para operar.")
 
 
     # =======================================================
-    # LOG
+    #   LIMPIAR TABLA DE MATCHES
     # =======================================================
-    def _write_log(self, evento, detalle=""):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def limpiar_tabla(self):
+        """
+        Limpia matches_pf.
+        Usar solo antes de una corrida FULL.
+        """
+        info("Limpiando tabla matches_pf...")
 
-        # Log en tabla SQLite
+        with self.engine.connect() as conn:
+            conn.execute(text("DELETE FROM matches_pf;"))
+
+        ok("Tabla matches_pf limpiada.")
+
+
+    # =======================================================
+    #   INSERTAR MATCHES
+    # =======================================================
+    def escribir_matches(self, df_matches: pd.DataFrame):
+        """
+        Inserta los matches del Matcher.
+        df_matches debe contener:
+            factura
+            cliente
+            fecha_emision
+            fecha_limite
+            fecha_mov
+            banco
+            operacion
+            monto_factura
+            monto_banco
+            diferencia_monto
+            similitud
+            resultado
+        """
+
+        info(f"Insertando {len(df_matches)} matches en PulseForge...")
+
         try:
-            self.cursor.execute(
-                "INSERT INTO logs (timestamp, evento, detalle) VALUES (?, ?, ?)",
-                (ts, evento, detalle),
+            df_matches.to_sql(
+                "matches_pf",
+                con=self.engine,
+                if_exists="append",
+                index=False
             )
-            self.conn.commit()
-        except:
-            warn("No se pudo escribir log en tabla log.")
+        except Exception as e:
+            error(f"Error insertando matches: {e}")
+            raise
 
-        # Log en archivo externo
-        logs_dir = os.path.join(os.path.dirname(self.db_path), "logs")
-        if not os.path.exists(logs_dir):
-            os.makedirs(logs_dir)
-
-        log_file = os.path.join(logs_dir, f"{datetime.now().strftime('%Y-%m-%d')}.log")
-
-        try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"[{ts}] {evento} — {detalle}\n")
-        except:
-            warn("No se pudo escribir log en archivo externo.")
-
-
-    # =======================================================
-    # VERIFICAR SI FACTURA YA EXISTE EN RESULTADOS
-    # =======================================================
-    def _existe(self, factura_code: str):
-        self.cursor.execute(
-            "SELECT Estado FROM match_results WHERE Factura = ?",
-            (factura_code,),
-        )
-        return self.cursor.fetchone()
-
-
-    # =======================================================
-    # GUARDAR RESULTADOS DEL MATCHER
-    # =======================================================
-    def guardar_matches(self, df: pd.DataFrame):
-        """
-        Guarda los resultados del cruce:
-        - Estado
-        - Pagos
-        - Fechas
-        - Cuenta
-        """
-
-        info("Escribiendo resultados del Matcher (incremental)...")
-
-        requeridas = [
-            "Factura",
-            "RUC",
-            "Razon_Social",
-            "Fecha_Pago",
-            "Monto_Pagado",
-            "Cuenta_Pago",
-            "Tipo_Pago",
-            "Estado",
-        ]
-
-        faltantes = [c for c in requeridas if c not in df.columns]
-        if faltantes:
-            error(f"Faltan columnas en match_writer: {faltantes}")
-            raise KeyError(f"Columnas faltantes: {faltantes}")
-
-        insertados = 0
-        actualizados = 0
-        fecha_registro = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        for _, row in df.iterrows():
-            factura_code = row["Factura"]
-            estado = row["Estado"]
-
-            previo = self._existe(factura_code)
-
-            # ===========================
-            # INSERT NUEVO
-            # ===========================
-            if previo is None:
-                self.cursor.execute(
-                    """
-                    INSERT INTO match_results (
-                        Factura, RUC, Razon_Social, Fecha_Pago,
-                        Monto_Pagado, Cuenta_Pago, Tipo_Pago,
-                        Estado, Fecha_Registro
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        factura_code,
-                        row["RUC"],
-                        row["Razon_Social"],
-                        row["Fecha_Pago"],
-                        row["Monto_Pagado"],
-                        row["Cuenta_Pagado"],
-                        row["Tipo_Pago"],
-                        estado,
-                        fecha_registro,
-                    )
-                )
-                insertados += 1
-                ok(f"Nuevo resultado insertado: {factura_code} -> {estado}")
-                self._write_log("Match insertado", f"{factura_code} -> {estado}")
-                continue
-
-            # ===================================
-            # UPDATE CUANDO CAMBIA EL ESTADO
-            # ===================================
-            estado_prev = previo[0]
-
-            # Caso 1: Antes Pendiente → ahora Pagada
-            if estado_prev != estado:
-                warn(f"Estado actualizado: {factura_code} | {estado_prev} → {estado}")
-
-                self.cursor.execute(
-                    """
-                    UPDATE match_results
-                    SET Fecha_Pago = ?,
-                        Monto_Pagado = ?,
-                        Cuenta_Pago = ?,
-                        Tipo_Pago = ?,
-                        Estado = ?,
-                        Fecha_Registro = ?
-                    WHERE Factura = ?
-                    """,
-                    (
-                        row["Fecha_Pago"],
-                        row["Monto_Pagado"],
-                        row["Cuenta_Pagado"],
-                        row["Tipo_Pago"],
-                        estado,
-                        fecha_registro,
-                        factura_code
-                    )
-                )
-                actualizados += 1
-                self._write_log("Match actualizado", f"{factura_code}: {estado_prev} → {estado}")
-                continue
-
-            # Si no hay cambios
-            info(f"Sin cambios: {factura_code} ({estado})")
-
-
-        self.conn.commit()
-
-        ok(f"Resultados guardados. Insertados: {insertados}, Actualizados: {actualizados}")
-
-
-    # =======================================================
-    # CERRAR
-    # =======================================================
-    def close(self):
-        try:
-            self.conn.close()
-            ok("Conexión a BD nueva cerrada.")
-        except:
-            warn("Error cerrando la conexión.")
+        ok("Matches insertados correctamente en matches_pf 🚀")
 
 
 
 # =======================================================
-# TEST DIRECTO
+#   TEST DIRECTO (opcional)
 # =======================================================
 if __name__ == "__main__":
-    info("🚀 Testeando MatchWriter...")
-
-    from src.extractors.invoices_extractor import InvoicesExtractor
-    from src.extractors.bank_extractor import BankExtractor
-    from src.extractors.clients_extractor import ClientsExtractor
-    from src.transformers.calculator import Calculator
-    from src.matchers.matcher import Matcher
-
-    inv = InvoicesExtractor()
-    cli = ClientsExtractor()
-    bank = BankExtractor()
-    calc = Calculator()
-    matcher = Matcher()
-
-    df_fact = inv.load_invoices().merge(cli.get_client_data(), on="RUC", how="left")
-    df_calc = calc.procesar_facturas(df_fact)
-    df_mov = bank.get_todos_movimientos()
-    df_match = matcher.cruzar(df_calc, df_mov)
-
-    writer = MatchWriter()
-    writer.guardar_matches(df_match)
-    writer.close()
+    warn("Test directo del MatchWriter. Solo para debug.")

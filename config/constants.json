@@ -1,0 +1,51 @@
+{
+  "estados_factura_validos": [
+    "EMITIDO",
+    "EMITIDA",
+    "FACTURADO",
+    "FACTURADA",
+    "APROBADO",
+    "APROBADA"
+  ],
+
+  "estados_factura_invalidos": [
+    "ANULADO",
+    "ANULADA",
+    "REVERSADO",
+    "REVERSADA",
+    "RECHAZADO",
+    "RECHAZADA",
+    "ELIMINADO"
+  ],
+
+  "keywords_interbancario": [
+    "interbancario",
+    "transfer interbancaria",
+    "cci",
+    "spei",
+    "interbanking",
+    "transferencia interbancaria"
+  ],
+
+  "keywords_factoring": [
+    "factoring",
+    "factoring bbva",
+    "factoring bcp",
+    "factoring scotiabank",
+    "factoring interbank"
+  ],
+
+  "keywords_pago": [
+    "abono",
+    "deposito",
+    "pago",
+    "transferencia",
+    "transfer",
+    "traspaso",
+    "ingreso"
+  ],
+
+  "min_similarity_razon_social": 0.60,
+
+  "considerar_montos_cero": false
+}

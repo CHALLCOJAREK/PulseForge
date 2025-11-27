@@ -4,8 +4,10 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import timedelta
+
 from src.core.env_loader import get_env
+from json import load
 
 # Prints estilo Fénix
 def info(msg): print(f"🔵 {msg}")
@@ -17,216 +19,139 @@ def error(msg): print(f"🔴 {msg}")
 class Calculator:
     """
     Calcula:
-    - Subtotal limpio
-    - IGV
-    - Total
-    - Detracción
-    - Monto neto a cuenta empresa
-    - Días de forma de pago
-    - Fecha de vencimiento (emisión + días forma de pago)
-
-    Trabaja sobre el DataFrame que viene de InvoicesExtractor.
+      - IGV
+      - detracción
+      - monto neto real (lo que ingresa a IBK)
+      - monto detracción (lo que ingresa a BN)
+      - fecha límite de pago (fecha_emisión + forma_pago)
+      - ventana de tolerancia (± DAYS_TOLERANCE_PAGO)
     """
 
     def __init__(self):
         self.env = get_env()
-        self.igv = self.env.IGV
-        self.porc_detraccion = self.env.DETRACCION_PORCENTAJE
 
-        # Cargar settings.json para saber cómo se llaman las columnas
-        from json import load
-
+        # ⚙ Cargar settings.json
         settings_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../config/settings.json")
         )
 
         if not os.path.exists(settings_path):
-            error(f"No se encontró settings.json en: {settings_path}")
-            raise FileNotFoundError("settings.json no encontrado")
+            error("settings.json no encontrado en Calculator.")
+            raise FileNotFoundError("settings.json no encontrado.")
 
         with open(settings_path, "r", encoding="utf-8") as f:
             self.settings = load(f)
 
-        self.cols = self.settings["columnas_facturas"]
+        # ⚙ Cargar constants.json
+        constants_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../../config/constants.json")
+        )
 
-        ok("Calculator listo para operar.")
+        if not os.path.exists(constants_path):
+            error("constants.json no encontrado.")
+            raise FileNotFoundError("constants.json no encontrado.")
 
+        with open(constants_path, "r", encoding="utf-8") as f:
+            self.constants = load(f)
 
-    # =======================================================
-    #     UTILIDAD: convertir fecha a datetime
-    # =======================================================
-    @staticmethod
-    def _parse_fecha(value):
-        """Convierte fechas comunes a datetime, tolerante a varios formatos."""
-        if isinstance(value, datetime):
-            return value
+        ok("Calculator inicializado correctamente.")
 
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return None
-
-            formatos = [
-                "%Y-%m-%d",
-                "%d/%m/%Y",
-                "%d-%m-%Y",
-                "%Y/%m/%d",
-                "%d.%m.%Y",
-            ]
-
-            for f in formatos:
-                try:
-                    return datetime.strptime(value, f)
-                except ValueError:
-                    continue
-
-        warn(f"Fecha no reconocida: {value}. Se asignará None.")
-        return None
 
 
     # =======================================================
-    #     UTILIDAD: convertir monto a float
+    #     PROCESO PRINCIPAL DEL CALCULATOR
     # =======================================================
-    @staticmethod
-    def _parse_monto(value):
-        """Convierte un monto en string a float limpio."""
-        if isinstance(value, (int, float)):
-            return float(value)
-
-        if isinstance(value, str):
-            limpio = (
-                value.replace(",", "")
-                     .replace("S/", "")
-                     .replace("s/", "")
-                     .replace("$", "")
-                     .replace(" ", "")
-                     .strip()
-            )
-            try:
-                return float(limpio)
-            except ValueError:
-                warn(f"Monto ilegible: {value}")
-                return None
-
-        warn(f"Monto desconocido: {value}")
-        return None
-
-
-    # =======================================================
-    #     UTILIDAD: extraer días de forma de pago
-    # =======================================================
-    @staticmethod
-    def _parse_forma_pago(value):
+    def process_facturas(self, df_facturas: pd.DataFrame):
         """
-        Extrae el número de días desde la forma de pago.
-        Ejemplos:
-        - "30"        -> 30
-        - "30 días"   -> 30
-        - "Contado"   -> 0
+        Devuelve las facturas enriquecidas con:
+
+            igv
+            total_con_igv
+            detraccion_monto
+            neto_recibido
+            fecha_limite_pago
+            fecha_inicio_ventana
+            fecha_fin_ventana
+
+        Estas columnas son claves para el Matcher.
         """
-        if value is None:
-            return 0
 
-        if isinstance(value, (int, float)):
-            return int(value)
+        info("Aplicando cálculos financieros a facturas...")
 
-        if isinstance(value, str):
-            value = value.lower().strip()
-            # Si dice contado, asumimos 0 días
-            if "contado" in value:
-                return 0
+        df = df_facturas.copy()
 
-            # Buscar primer número en el string
-            num = ""
-            for ch in value:
-                if ch.isdigit():
-                    num += ch
-                elif num:
-                    break
+        IGV = float(self.env.get("IGV", 0.18))
+        DTR = float(self.env.get("DETRACCION_PORCENTAJE", 0.04))
+        TOL = int(self.env.get("DAYS_TOLERANCE_PAGO", 14))
 
-            if num:
-                return int(num)
+        # =======================================================
+        # IGV → subtotal * IGV
+        # =======================================================
+        df["igv"] = df["subtotal"] * IGV
 
-        warn(f"No se pudo interpretar Forma de pago: {value}. Se usará 0 días.")
-        return 0
+        # =======================================================
+        # Total con IGV
+        # =======================================================
+        df["total_con_igv"] = df["subtotal"] + df["igv"]
+
+        # =======================================================
+        # Detracción → total_con_igv * detracción%
+        # =======================================================
+        df["detraccion_monto"] = df["total_con_igv"] * DTR
+
+        # =======================================================
+        # Neto recibido (lo que llega a IBK)
+        # =======================================================
+        df["neto_recibido"] = df["total_con_igv"] - df["detraccion_monto"]
+
+        # =======================================================
+        # Fecha límite de pago → fecha_emision + forma_pago
+        # =======================================================
+        df["fecha_limite_pago"] = df["fecha_emision"] + pd.to_timedelta(df["forma_pago"], unit="D")
+
+        # =======================================================
+        # Ventana de pago válida → tolerancia ± días
+        # =======================================================
+        df["fecha_inicio_ventana"] = df["fecha_limite_pago"] - timedelta(days=TOL)
+        df["fecha_fin_ventana"]    = df["fecha_limite_pago"] + timedelta(days=TOL)
+
+        ok("Cálculos financieros aplicados con éxito.")
+        return df
 
 
     # =======================================================
-    #     PROCESO PRINCIPAL
+    #     PREPARAR MOVIMIENTOS BANCARIOS PARA MATCHER
     # =======================================================
-    def procesar_facturas(self, df: pd.DataFrame) -> pd.DataFrame:
+    def process_bancos(self, df_bancos: pd.DataFrame):
         """
-        Recibe un DataFrame de facturas (de InvoicesExtractor)
-        y devuelve un DataFrame con columnas calculadas:
+        Devuelve movimientos bancarios enriquecidos con:
 
-        - Subtotal_calc
-        - IGV_calc
-        - Total_calc
-        - Detraccion_calc
-        - Monto_Neto_calc
-        - Dias_Forma_Pago
-        - Fecha_Emision_Parsed
-        - Fecha_Vencimiento
+            monto_variacion_min
+            monto_variacion_max
+            es_dolares (flag)
         """
-        info("Procesando cálculos contables de facturas...")
 
-        df = df.copy()
+        info("Preparando movimientos bancarios...")
 
-        col_subtotal = self.cols["subtotal"]
-        col_fecha = self.cols["fecha_emision"]
-        col_forma = self.cols["forma_pago"]
+        df = df_bancos.copy()
 
-        # Subtotal limpio
-        df["Subtotal_calc"] = df[col_subtotal].apply(self._parse_monto)
+        VAR = float(self.env.get("MONTO_VARIACION", 0.50))
 
-        # IGV
-        df["IGV_calc"] = df["Subtotal_calc"] * self.igv
+        # Variación permitida del monto para comparación
+        df["monto_variacion_min"] = df["Monto"] - VAR
+        df["monto_variacion_max"] = df["Monto"] + VAR
 
-        # Total
-        df["Total_calc"] = df["Subtotal_calc"] + df["IGV_calc"]
+        # Bandera para pagos en dólares
+        df["es_dolares"] = df["Moneda"].astype(str).str.upper().str.contains("USD")
 
-        # Detracción
-        df["Detraccion_calc"] = df["Total_calc"] * self.porc_detraccion
-
-        # Monto neto que ingresa a cuenta empresa
-        df["Monto_Neto_calc"] = df["Total_calc"] - df["Detraccion_calc"]
-
-        # Forma de pago → días
-        df["Dias_Forma_Pago"] = df[col_forma].apply(self._parse_forma_pago)
-
-        # Parseo de fecha
-        df["Fecha_Emision_Parsed"] = df[col_fecha].apply(self._parse_fecha)
-
-        # Fecha de vencimiento: emisión + días forma de pago
-        def _calc_venc(row):
-            f = row["Fecha_Emision_Parsed"]
-            d = row["Dias_Forma_Pago"]
-            if f:
-                return f + timedelta(days=d)
-            return None
-
-        df["Fecha_Vencimiento"] = df.apply(_calc_venc, axis=1)
-
-        info("Vista previa de facturas con cálculos:")
-        print(df.head())
-
-        ok("Cálculos contables aplicados correctamente.")
+        ok("Movimientos bancarios preparados correctamente.")
         return df
 
 
 
 # =======================================================
-#   TEST DIRECTO
+#     TEST DIRECTO (opcional)
 # =======================================================
 if __name__ == "__main__":
-    info("🚀 Testeando Calculator con InvoicesExtractor...")
-    from src.extractors.invoices_extractor import InvoicesExtractor
-
-    extractor = InvoicesExtractor()
-    df_facturas = extractor.load_invoices()
-
-    calc = Calculator()
-    df_resultado = calc.procesar_facturas(df_facturas)
-
-    print("\n🔍 Vista previa final:")
-    print(df_resultado.head())
+    warn("Test directo del Calculator (solo para debug).")
+    # Aquí no se prueban extractores para no duplicar procesos.
