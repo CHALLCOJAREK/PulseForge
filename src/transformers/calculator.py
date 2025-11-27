@@ -5,9 +5,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 
 import pandas as pd
 from datetime import timedelta
+from json import load
 
 from src.core.env_loader import get_env
-from json import load
 
 # Prints estilo Fénix
 def info(msg): print(f"🔵 {msg}")
@@ -17,65 +17,61 @@ def error(msg): print(f"🔴 {msg}")
 
 
 class Calculator:
-    """
-    Calcula:
-      - IGV
-      - detracción
-      - monto neto real (lo que ingresa a IBK)
-      - monto detracción (lo que ingresa a BN)
-      - fecha límite de pago (fecha_emisión + forma_pago)
-      - ventana de tolerancia (± DAYS_TOLERANCE_PAGO)
-    """
 
     def __init__(self):
         self.env = get_env()
 
-        # ⚙ Cargar settings.json
-        settings_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../config/settings.json")
-        )
+        # Load settings
+        cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config"))
 
-        if not os.path.exists(settings_path):
-            error("settings.json no encontrado en Calculator.")
-            raise FileNotFoundError("settings.json no encontrado.")
-
-        with open(settings_path, "r", encoding="utf-8") as f:
+        with open(os.path.join(cfg_dir, "settings.json"), "r", encoding="utf-8") as f:
             self.settings = load(f)
 
-        # ⚙ Cargar constants.json
-        constants_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../config/constants.json")
-        )
-
-        if not os.path.exists(constants_path):
-            error("constants.json no encontrado.")
-            raise FileNotFoundError("constants.json no encontrado.")
-
-        with open(constants_path, "r", encoding="utf-8") as f:
+        with open(os.path.join(cfg_dir, "constants.json"), "r", encoding="utf-8") as f:
             self.constants = load(f)
 
         ok("Calculator inicializado correctamente.")
 
 
+    # =======================================================
+    #  PARSE DE FORMA DE PAGO (robusto)
+    # =======================================================
+    def _parse_forma_pago(self, value):
+        """
+        Convierte valores típicos en días:
+        - "15" → 15
+        - "15 días" → 15
+        - "CREDITO 30" → 30
+        - "CONTADO" → 0
+        - "CRÉDITO" → 0 si no especifica
+        - valores vacíos → 0
+        """
+        if value is None:
+            return 0
+
+        txt = str(value).strip().lower()
+
+        # Contado
+        if "contado" in txt:
+            return 0
+
+        # Crédito sin número → asumimos 0
+        if "credito" in txt and not any(char.isdigit() for char in txt):
+            return 0
+
+        # Si contiene un número, lo extraemos
+        nums = "".join([c for c in txt if c.isdigit()])
+        if nums:
+            return int(nums)
+
+        # Si no, 0 por defecto
+        return 0
+
 
     # =======================================================
-    #     PROCESO PRINCIPAL DEL CALCULATOR
+    #  PROCESO PRINCIPAL
     # =======================================================
     def process_facturas(self, df_facturas: pd.DataFrame):
-        """
-        Devuelve las facturas enriquecidas con:
-
-            igv
-            total_con_igv
-            detraccion_monto
-            neto_recibido
-            fecha_limite_pago
-            fecha_inicio_ventana
-            fecha_fin_ventana
-
-        Estas columnas son claves para el Matcher.
-        """
-
         info("Aplicando cálculos financieros a facturas...")
 
         df = df_facturas.copy()
@@ -84,74 +80,49 @@ class Calculator:
         DTR = float(self.env.get("DETRACCION_PORCENTAJE", 0.04))
         TOL = int(self.env.get("DAYS_TOLERANCE_PAGO", 14))
 
-        # =======================================================
-        # IGV → subtotal * IGV
-        # =======================================================
-        df["igv"] = df["subtotal"] * IGV
+        # --------------------------
+        # Conversión y limpieza
+        # --------------------------
+        df["subtotal"] = pd.to_numeric(df["subtotal"], errors="coerce").fillna(0)
+        df["fecha_emision"] = pd.to_datetime(df["fecha_emision"], errors="coerce")
 
-        # =======================================================
-        # Total con IGV
-        # =======================================================
-        df["total_con_igv"] = df["subtotal"] + df["igv"]
+        df["dias_pago"] = df["forma_pago"].apply(self._parse_forma_pago)
 
-        # =======================================================
-        # Detracción → total_con_igv * detracción%
-        # =======================================================
-        df["detraccion_monto"] = df["total_con_igv"] * DTR
+        # ANULADOS / SUBTOTAL = 0 → ignorar cálculos
+        df_valid = df[df["subtotal"] > 0].copy()
 
-        # =======================================================
-        # Neto recibido (lo que llega a IBK)
-        # =======================================================
-        df["neto_recibido"] = df["total_con_igv"] - df["detraccion_monto"]
+        # --------------------------
+        # Cálculos principales
+        # --------------------------
+        df_valid["igv"]             = df_valid["subtotal"] * IGV
+        df_valid["total_con_igv"]   = df_valid["subtotal"] + df_valid["igv"]
+        df_valid["detraccion_monto"] = df_valid["total_con_igv"] * DTR
+        df_valid["neto_recibido"]    = df_valid["total_con_igv"] - df_valid["detraccion_monto"]
 
-        # =======================================================
-        # Fecha límite de pago → fecha_emision + forma_pago
-        # =======================================================
-        df["fecha_limite_pago"] = df["fecha_emision"] + pd.to_timedelta(df["forma_pago"], unit="D")
+        # Fechas
+        df_valid["fecha_limite_pago"] = df_valid["fecha_emision"] + df_valid["dias_pago"].apply(lambda x: timedelta(days=x))
 
-        # =======================================================
-        # Ventana de pago válida → tolerancia ± días
-        # =======================================================
-        df["fecha_inicio_ventana"] = df["fecha_limite_pago"] - timedelta(days=TOL)
-        df["fecha_fin_ventana"]    = df["fecha_limite_pago"] + timedelta(days=TOL)
+        # Ventanas
+        df_valid["fecha_inicio_ventana"] = df_valid["fecha_limite_pago"] - timedelta(days=TOL)
+        df_valid["fecha_fin_ventana"]    = df_valid["fecha_limite_pago"] + timedelta(days=TOL)
 
         ok("Cálculos financieros aplicados con éxito.")
-        return df
+        return df_valid
 
 
     # =======================================================
-    #     PREPARAR MOVIMIENTOS BANCARIOS PARA MATCHER
+    #   MOVIMIENTOS BANCARIOS
     # =======================================================
     def process_bancos(self, df_bancos: pd.DataFrame):
-        """
-        Devuelve movimientos bancarios enriquecidos con:
-
-            monto_variacion_min
-            monto_variacion_max
-            es_dolares (flag)
-        """
-
         info("Preparando movimientos bancarios...")
 
         df = df_bancos.copy()
 
         VAR = float(self.env.get("MONTO_VARIACION", 0.50))
 
-        # Variación permitida del monto para comparación
         df["monto_variacion_min"] = df["Monto"] - VAR
         df["monto_variacion_max"] = df["Monto"] + VAR
-
-        # Bandera para pagos en dólares
         df["es_dolares"] = df["Moneda"].astype(str).str.upper().str.contains("USD")
 
         ok("Movimientos bancarios preparados correctamente.")
         return df
-
-
-
-# =======================================================
-#     TEST DIRECTO (opcional)
-# =======================================================
-if __name__ == "__main__":
-    warn("Test directo del Calculator (solo para debug).")
-    # Aquí no se prueban extractores para no duplicar procesos.
