@@ -5,10 +5,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")
 
 from datetime import datetime
 import sqlite3
+import pandas as pd
 
 # Core
 from src.core.env_loader import get_env
-from src.loaders.newdb_builder import NewDBBuilder
 
 # Extractors
 from src.extractors.invoices_extractor import InvoicesExtractor
@@ -16,12 +16,12 @@ from src.extractors.clients_extractor import ClientsExtractor
 from src.extractors.bank_extractor import BankExtractor
 
 # Transformers
+from src.transformers.data_mapper import DataMapper
 from src.transformers.calculator import Calculator
-
-# Matcher
 from src.transformers.matcher import Matcher
 
-# Writers
+# Loaders
+from src.loaders.newdb_builder import NewDBBuilder
 from src.loaders.invoice_writer import InvoiceWriter
 from src.loaders.match_writer import MatchWriter
 
@@ -33,141 +33,143 @@ def error(msg): print(f"🔴 {msg}")
 
 
 def incremental_run():
-    info("⚡ Iniciando ejecución INCREMENTAL de PulseForge...")
+    info("⚡ Iniciando ejecución INCREMENTAL de PulseForge (por COMBINADA)...")
     start_time = datetime.now()
 
-    # =====================================================================
-    # 0. Cargar entorno y columnas reales desde settings.json
-    # =====================================================================
     env = get_env()
-    from json import load
+    db_path = env.get("PULSEFORGE_NEWDB_PATH")
 
-    settings_path = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "../../config/settings.json")
-    )
-    with open(settings_path, "r", encoding="utf-8") as f:
-        settings = load(f)
-
-    col = settings["columnas_facturas"]   # columnas reales del JSON
-
-    # =====================================================================
-    # 1. Asegurar BD nueva lista
-    # =====================================================================
-    builder = NewDBBuilder()
-    builder.build()
-
-    # =====================================================================
-    # 2. Leer facturas ya procesadas en PulseForge
-    # =====================================================================
-    conn = sqlite3.connect(env.DB_PATH_NUEVA)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT Factura FROM facturas_procesadas")
-    existentes = {row[0] for row in cursor.fetchall()}
-    info(f"Facturas ya guardadas en BD Nueva: {len(existentes)}")
-
-    # =====================================================================
-    # 3. Extraer facturas desde DataPulse
-    # =====================================================================
-    inv = InvoicesExtractor()
-    df_facturas = inv.load_invoices()
-
-    # Crear Combinada usando el nombre real de columnas
-    df_facturas["Combinada"] = (
-        df_facturas[col["serie"]].astype(str)
-        + "-"
-        + df_facturas[col["numero"]].astype(str)
-    )
-
-    # =====================================================================
-    # 4. Filtrar solo facturas nuevas
-    # =====================================================================
-    df_nuevas = df_facturas[~df_facturas["Combinada"].isin(existentes)]
-
-    info(f"Facturas nuevas encontradas: {len(df_nuevas)}")
-
-    # =====================================================================
-    # 5. Si hay nuevas facturas → procesarlas
-    # =====================================================================
-    if not df_nuevas.empty:
-        # 5.1 Extraer clientes
-        cli = ClientsExtractor()
-        df_cli = cli.get_client_data()
-
-        info("Unificando facturas nuevas con razón social...")
-        df_nuevas = df_nuevas.merge(df_cli, on="RUC", how="left")
-
-        # 5.2 Calcular importes
-        calc = Calculator()
-        df_calc_nuevas = calc.procesar_facturas(df_nuevas)
-
-        # 5.3 Guardar nuevas facturas
-        writer_inv = InvoiceWriter()
-        writer_inv.guardar_facturas(df_calc_nuevas)
-        writer_inv.close()
-
-    else:
-        warn("No hay nuevas facturas. Continuando con cruce bancario...")
-
-    # =====================================================================
-    # 6. Cargar bancos
-    # =====================================================================
-    bank = BankExtractor()
-    df_bancos = bank.get_todos_movimientos()
-
-    # =====================================================================
-    # 7. Cargar facturas pendientes para cruce
-    # =====================================================================
-    cursor.execute("SELECT Factura FROM match_results WHERE Estado = 'Pendiente'")
-    pendientes = {row[0] for row in cursor.fetchall()}
-
-    info(f"Facturas pendientes para cruce: {len(pendientes)}")
-
-    if not pendientes:
-        ok("No hay facturas pendientes. Nada más por hacer.")
+    if not db_path:
+        error("PULSEFORGE_NEWDB_PATH no definido en .env. Abortando incremental.")
         return
 
-    # Tomar SOLO esas facturas desde df_facturas
-    df_pend = df_facturas[df_facturas["Combinada"].isin(pendientes)]
+    # =====================================================
+    # 0) Asegurar estructura de BD (idempotente)
+    # =====================================================
+    builder = NewDBBuilder()
+    builder.crear_tablas()
 
-    # Unir con clientes
-    cli = ClientsExtractor()
-    df_cli = cli.get_client_data()
-    df_pend = df_pend.merge(df_cli, on="RUC", how="left")
+    invoice_writer = InvoiceWriter()
+    match_writer   = MatchWriter()
 
-    # Recalcular importes
+    # =====================================================
+    # 1) Leer COMBINADAS ya procesadas en facturas_pf
+    # =====================================================
+    info("📂 Leyendo facturas ya existentes en facturas_pf...")
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT combinada FROM facturas_pf;")
+        existentes = {row[0] for row in cur.fetchall()}
+        conn.close()
+    except Exception as e:
+        error(f"No se pudo leer facturas_pf: {e}")
+        return
+
+    info(f"Facturas ya registradas en PulseForge: {len(existentes)}")
+
+    # =====================================================
+    # 2) EXTRACTION: clientes, facturas, bancos
+    # =====================================================
+    info("📥 Extrayendo clientes desde DataPulse...")
+    clientes_df = ClientsExtractor().get_client_data()
+
+    info("📥 Extrayendo facturas desde DataPulse...")
+    facturas_df = InvoicesExtractor().load_invoices()
+    if facturas_df.empty:
+        warn("No se encontraron facturas nuevas en DataPulse. Nada que procesar.")
+        return
+
+    info("📥 Extrayendo movimientos bancarios desde DataPulse...")
+    bancos_df = BankExtractor().get_all()   # OJO: usar get_all() también en full_run
+    if bancos_df.empty:
+        warn("No se encontraron movimientos bancarios. Se cargarán solo facturas nuevas sin matching.")
+
+    # =====================================================
+    # 3) MAPPING
+    # =====================================================
+    mapper = DataMapper()
+
+    info("🔄 Mapeando clientes...")
+    clientes_m = mapper.map_clientes(clientes_df)
+
+    info("🔄 Mapeando facturas...")
+    facturas_m = mapper.map_facturas(facturas_df)
+
+    info("🔄 Mapeando bancos...")
+    bancos_m = mapper.map_bancos(bancos_df)
+
+    if facturas_m.empty:
+        warn("Tras el mapeo, no quedaron facturas válidas. Abortando incremental.")
+        return
+
+    # =====================================================
+    # 4) CALCULATOR (sobre TODAS las facturas mapeadas)
+    # =====================================================
+    info("🧮 Ejecutando cálculos financieros sobre facturas...")
     calc = Calculator()
-    df_calc_pend = calc.procesar_facturas(df_pend)
+    facturas_calc_all = calc.process_facturas(facturas_m)
 
-    # =====================================================================
-    # 8. Ejecutar matcher
-    # =====================================================================
-    matcher = Matcher()
-    df_match = matcher.cruzar(df_calc_pend, df_bancos)
+    info("🧮 Preparando movimientos bancarios para matching...")
+    bancos_calc = calc.process_bancos(bancos_m) if not bancos_m.empty else pd.DataFrame()
 
-    # =====================================================================
-    # 9. Guardar matches
-    # =====================================================================
-    writer_match = MatchWriter()
-    writer_match.guardar_matches(df_match)
-    writer_match.close()
+    # =====================================================
+    # 5) Filtrar SOLO facturas nuevas por COMBINADA
+    # =====================================================
+    info("📌 Filtrando facturas nuevas por COMBINADA...")
 
-    # =====================================================================
-    # 10. Log final
-    # =====================================================================
-    builder.write_log(
-        "IncrementalRun",
-        f"Nuevas={len(df_nuevas)} | Pendientes procesadas={len(df_pend)}"
-    )
+    if "combinada" not in facturas_calc_all.columns:
+        error("La columna 'combinada' no existe en facturas_calc_all. Revisa el DataMapper.")
+        return
 
-    # =====================================================================
-    # 11. Tiempo total
-    # =====================================================================
+    facturas_nuevas = facturas_calc_all[~facturas_calc_all["combinada"].isin(existentes)].copy()
+    info(f"Facturas nuevas detectadas: {len(facturas_nuevas)}")
+
+    if facturas_nuevas.empty:
+        ok("No hay facturas nuevas. Incremental sin cambios.")
+        end_time = datetime.now()
+        dur = (end_time - start_time).total_seconds()
+        info(f"🕒 Duración total: {dur} segundos")
+        return
+
+    # =====================================================
+    # 6) MATCHER solo para facturas nuevas
+    # =====================================================
+    if bancos_calc.empty:
+        warn("No hay movimientos bancarios. Se insertan facturas nuevas sin matches.")
+        matches_nuevos = pd.DataFrame()
+    else:
+        info("🧩 Ejecutando matching SOLO para facturas nuevas...")
+        matcher = Matcher()
+        matches_nuevos = matcher.match(facturas_nuevas, bancos_calc)
+        info(f"Matches generados para facturas nuevas: {len(matches_nuevos)}")
+
+    # =====================================================
+    # 7) WRITE → Insertar NUEVAS facturas y matches
+    # =====================================================
+    info("📤 Insertando facturas nuevas en facturas_pf...")
+    invoice_writer.escribir_facturas(facturas_nuevas)
+
+    if not matches_nuevos.empty:
+        info("📤 Insertando matches nuevos en matches_pf...")
+        match_writer.escribir_matches(matches_nuevos)
+    else:
+        warn("No se insertaron matches (DataFrame vacío).")
+
+    # =====================================================
+    # 8) Resumen final
+    # =====================================================
     end_time = datetime.now()
-    duracion = (end_time - start_time).total_seconds()
+    dur = (end_time - start_time).total_seconds()
 
     ok("⚡ PulseForge – INCREMENTAL COMPLETADO ⚡")
-    info(f"🕒 Duración total: {duracion} segundos")
+    print("\n============== RESUMEN INCREMENTAL ==============")
+    print(f"Facturas nuevas procesadas:      {len(facturas_nuevas)}")
+    print(f"Movimientos bancarios usados:    {len(bancos_calc)}")
+    print(f"Matches nuevos generados:        {len(matches_nuevos)}")
+    print(f"Duración total (segundos):       {dur}")
+    print("=================================================\n")
 
 
 if __name__ == "__main__":

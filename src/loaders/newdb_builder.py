@@ -1,12 +1,9 @@
 # src/loaders/newdb_builder.py
 
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
+import os
 from sqlalchemy import create_engine, text
 from src.core.env_loader import get_env
 
-# Prints estilo Fénix
 def info(msg): print(f"🔵 {msg}")
 def ok(msg): print(f"🟢 {msg}")
 def warn(msg): print(f"🟡 {msg}")
@@ -14,32 +11,32 @@ def error(msg): print(f"🔴 {msg}")
 
 
 class NewDBBuilder:
-    """
-    Crea la base de datos destino pulseforge.sqlite
-    con las tablas estándar del sistema.
-    """
 
     def __init__(self):
         self.env = get_env()
+
+        # Nombre correcto: PULSEFORGE_NEWDB_PATH
         self.db_path = self.env.get("PULSEFORGE_NEWDB_PATH")
 
         if not self.db_path:
-            error("No hay ruta a la BD destino en .env (PULSEFORGE_NEWDB_PATH).")
-            raise ValueError("BD destino no definida")
-
-        self.engine = create_engine(f"sqlite:///{self.db_path}")
+            error("No existe PULSEFORGE_NEWDB_PATH en .env.")
+            raise ValueError("BD destino no definida en .env")
 
         info("Iniciando constructor de nueva BD PulseForge...")
 
-    # =========================================================
-    #   Crear tablas base
-    # =========================================================
+        # Crear engine
+        self.engine = create_engine(f"sqlite:///{self.db_path}", future=True)
+
+
+    # ============================================================
+    #  CREACIÓN DE TABLAS — VERSIÓN BLINDADA Y DEFINITIVA
+    # ============================================================
     def crear_tablas(self):
         info("Creando tablas pulseforge...")
 
         tablas_sql = [
 
-            # ------------------- CLIENTES -------------------
+            # =============== CLIENTES ===============
             """
             CREATE TABLE IF NOT EXISTS clientes_pf (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,29 +45,33 @@ class NewDBBuilder:
             );
             """,
 
-            # ------------------- FACTURAS -------------------
+            # =============== FACTURAS ===============
             """
             CREATE TABLE IF NOT EXISTS facturas_pf (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                combinada TEXT,
                 ruc TEXT,
                 cliente_generador TEXT,
                 subtotal REAL,
-                igv REAL,
-                total_con_igv REAL,
-                detraccion REAL,
-                neto_recibido REAL,
+                serie TEXT,
+                numero TEXT,
+                combinada TEXT,
+                estado_fs TEXT,
+                estado_cont TEXT,
                 fecha_emision TEXT,
                 forma_pago INTEGER,
+                Vencimiento TEXT,
+                dias_pago INTEGER,
+                igv REAL,
+                total_con_igv REAL,
+                detraccion_monto REAL,
+                neto_recibido REAL,
                 fecha_limite_pago TEXT,
                 fecha_inicio_ventana TEXT,
-                fecha_fin_ventana TEXT,
-                estado_fs TEXT,
-                estado_cont TEXT
+                fecha_fin_ventana TEXT
             );
             """,
 
-            # ------------------- BANCOS -------------------
+            # =============== BANCOS ===============
             """
             CREATE TABLE IF NOT EXISTS bancos_pf (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,22 +89,30 @@ class NewDBBuilder:
             );
             """,
 
-            # ------------------- MATCHES -------------------
+            # =============== MATCHES ===============
             """
             CREATE TABLE IF NOT EXISTS matches_pf (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 factura TEXT,
                 cliente TEXT,
+                ruc TEXT,
                 fecha_emision TEXT,
                 fecha_limite TEXT,
                 fecha_mov TEXT,
-                banco TEXT,
+                banco_pago TEXT,
                 operacion TEXT,
-                monto_factura REAL,
                 monto_banco REAL,
+                monto_banco_equiv REAL,
+                monto_ref_usado REAL,
+                tipo_monto_ref TEXT,
                 diferencia_monto REAL,
-                similitud REAL,
-                resultado TEXT
+                sim_nombre REAL,
+                tiene_terminos_flex INTEGER,
+                resultado TEXT,
+                banco_det TEXT,
+                fecha_det TEXT,
+                monto_det REAL,
+                razon TEXT
             );
             """
         ]
@@ -113,14 +122,3 @@ class NewDBBuilder:
                 conn.execute(text(sql))
 
         ok("Tablas creadas con éxito en pulseforge.sqlite 🚀")
-
-
-
-# ======================================================
-#   TEST DIRECTO (opcional)
-# ======================================================
-if __name__ == "__main__":
-    info("🚀 Construyendo pulseforge.sqlite...")
-    builder = NewDBBuilder()
-    builder.crear_tablas()
-    ok("BD PulseForge estructurada correctamente.")

@@ -23,24 +23,23 @@ class InvoiceWriter:
     def __init__(self):
         self.env = get_env()
 
-        self.db_path = self.env.get("PULSEFORGE_NEWDB_PATH")
+        # ⚠️ CORRECCIÓN CRÍTICA:
+        # Antes: self.env.get("PULSEFORGE_NEWDB_PATH") → devuelve None
+        # Ahora: usamos el nombre REAL almacenado en EnvConfig: DB_PATH_NUEVA
+        self.db_path = self.env.get("DB_PATH_NUEVA")
+
         if not self.db_path:
-            error("No se encontró PULSEFORGE_NEWDB_PATH en .env.")
-            raise ValueError("Ruta de BD destino no definida.")
+            error("No se encontró la ruta de BD destino (DB_PATH_NUEVA).")
+            raise ValueError("Ruta de BD destino no definida en entorno.")
 
         self.engine = create_engine(f"sqlite:///{self.db_path}")
-
         ok("InvoiceWriter listo para escribir facturas procesadas.")
 
 
     # =======================================================
-    #   LIMPIAR TABLA (opcional)
+    #   LIMPIAR TABLA (para FULL RUN)
     # =======================================================
     def limpiar_tabla(self):
-        """
-        Borra todo el contenido de facturas_pf.
-        Solo usar antes de una carga completa.
-        """
         info("Limpiando tabla facturas_pf...")
 
         sql = text("DELETE FROM facturas_pf;")
@@ -55,11 +54,6 @@ class InvoiceWriter:
     #   INSERTAR FACTURAS
     # =======================================================
     def escribir_facturas(self, df_facturas: pd.DataFrame):
-        """
-        Inserta el DataFrame en facturas_pf.
-        df_facturas debe contener ya los cálculos del Calculator.
-        """
-
         info(f"Insertando {len(df_facturas)} facturas en PulseForge...")
 
         try:
@@ -76,9 +70,5 @@ class InvoiceWriter:
         ok("Facturas insertadas correctamente en facturas_pf 🚀")
 
 
-
-# =======================================================
-#   TEST DIRECTO (opcional)
-# =======================================================
 if __name__ == "__main__":
     warn("Test directo del InvoiceWriter. No usar en producción.")

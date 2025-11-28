@@ -22,9 +22,11 @@ class MatchWriter:
     def __init__(self):
         self.env = get_env()
 
-        self.db_path = self.env.get("PULSEFORGE_NEWDB_PATH")
+        # Usar el nombre estandarizado del sistema
+        self.db_path = getattr(self.env, "DB_PATH_NUEVA", None)
+
         if not self.db_path:
-            error("No se encontró PULSEFORGE_NEWDB_PATH en .env.")
+            error("No se encontró DB_PATH_NUEVA (PULSEFORGE_NEWDB_PATH) en .env.")
             raise ValueError("Ruta de BD destino no definida.")
 
         self.engine = create_engine(f"sqlite:///{self.db_path}")
@@ -54,19 +56,6 @@ class MatchWriter:
     def escribir_matches(self, df_matches: pd.DataFrame):
         """
         Inserta los matches del Matcher.
-        df_matches debe contener:
-            factura
-            cliente
-            fecha_emision
-            fecha_limite
-            fecha_mov
-            banco
-            operacion
-            monto_factura
-            monto_banco
-            diferencia_monto
-            similitud
-            resultado
         """
 
         info(f"Insertando {len(df_matches)} matches en PulseForge...")
@@ -83,7 +72,6 @@ class MatchWriter:
             raise
 
         ok("Matches insertados correctamente en matches_pf 🚀")
-
 
 
 # =======================================================

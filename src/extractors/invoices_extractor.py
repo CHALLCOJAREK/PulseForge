@@ -17,22 +17,6 @@ def error(msg): print(f"🔴 {msg}")
 
 
 class InvoicesExtractor:
-    """
-    Extrae y normaliza facturas desde la BD DataPulse,
-    usando nombres reales declarados en settings.json.
-
-    Devuelve DataFrame con:
-    - RUC
-    - Cliente Generador
-    - Serie
-    - Número
-    - Combinada
-    - Subtotal
-    - Fecha Emisión
-    - Condición Pago (días)
-    - Vencimiento (si existe)
-    - Estados (fs y cont)
-    """
 
     def __init__(self):
         self.env = get_env()
@@ -40,32 +24,17 @@ class InvoicesExtractor:
 
         info("Inicializando extractor de facturas...")
 
-        # -------------------------------
-        # Cargar settings.json
-        # -------------------------------
         from json import load
         
         settings_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../config/settings.json")
         )
-
-        if not os.path.exists(settings_path):
-            error(f"No se encontró settings.json en: {settings_path}")
-            raise FileNotFoundError("settings.json no encontrado")
-
-        with open(settings_path, "r", encoding="utf-8") as f:
-            self.settings = load(f)
-
-        # -------------------------------
-        # Cargar constants.json
-        # -------------------------------
         constants_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../config/constants.json")
         )
 
-        if not os.path.exists(constants_path):
-            error(f"No se encontró constants.json en: {constants_path}")
-            raise FileNotFoundError("constants.json no encontrado")
+        with open(settings_path, "r", encoding="utf-8") as f:
+            self.settings = load(f)
 
         with open(constants_path, "r", encoding="utf-8") as f:
             self.constants = load(f)
@@ -74,7 +43,7 @@ class InvoicesExtractor:
 
 
     # =======================================================
-    #   CARGA COMPLETA DESDE SQL
+    # Lectura SQL
     # =======================================================
     def _load_invoices_table(self):
         tabla = self.settings["tablas"]["facturas"]
@@ -93,73 +62,89 @@ class InvoicesExtractor:
 
 
     # =======================================================
-    #   PROCESO PRINCIPAL (NO HACE PRUEBAS)
+    # Resolver nombre real de columna
+    # =======================================================
+    def _resolve_column(self, df, candidates):
+        """
+        Devuelve el nombre REAL de una columna aunque tenga:
+        - Mayúsculas/minúsculas
+        - Slashes
+        - Espacios
+        - Aliases raros ("Ruc / Dni")
+        """
+        normalized = {c.lower().replace(" ", "").replace("/", ""): c for c in df.columns}
+
+        for candidate in candidates:
+            key = candidate.lower().replace(" ", "").replace("/", "")
+            if key in normalized:
+                return normalized[key]
+
+        return None
+
+
+    # =======================================================
+    # PROCESO PRINCIPAL
     # =======================================================
     def load_invoices(self):
+        df = self._load_invoices_table()
         col = self.settings["columnas_facturas"]
         cst = self.constants
 
-        df = self._load_invoices_table()
+        # Diccionario mapeado inteligente
+        resolved = {}
 
-        # ---------------------------------------------------
-        # Validar columnas obligatorias
-        # ---------------------------------------------------
-        required = [
-            col["ruc"], col["cliente_generador"],
-            col["subtotal"], col["serie"], col["numero"],
-            col["fecha_emision"], col["forma_pago"]
-        ]
+        # Posibles alias para cada columna importante
+        aliases = {
+            "ruc": ["ruc", "rucdni", "ruc/dni", "ruc / dni", "documento", "cliente_ruc"],
+            "cliente_generador": ["cliente_generador", "razon social", "cliente"],
+            "subtotal": ["subtotal", "sub total", "monto"],
+            "serie": ["serie", "seriefactura"],
+            "numero": ["numero", "num", "número"],
+            "fecha_emision": ["fechaemision", "fecha emision", "f_emision"],
+            "forma_pago": ["condicion de pago", "forma_pago", "condicionpago"],
+        }
 
-        missing = [c for c in required if c not in df.columns]
-        if missing:
-            error(f"Faltan columnas en tabla de facturas: {missing}")
-            raise KeyError(f"Columnas faltantes: {missing}")
+        # Resolver cada columna real
+        for key, options in aliases.items():
+            # primero prueba el nombre exacto del settings.json
+            preferred = col[key]
+            candidates = [preferred] + options
 
-        ok("Columnas necesarias detectadas correctamente.")
+            real = self._resolve_column(df, candidates)
 
+            if real is None:
+                error(f"No se pudo resolver columna: {key} | intentado: {candidates}")
+                raise KeyError(f"Columna no encontrada: {key}")
 
-        # ---------------------------------------------------
-        # Filtrar facturas inválidas según constants.json
-        # ---------------------------------------------------
-        if col["estado_fs"] in df.columns:
-            df = df[~df[col["estado_fs"]].astype(str).str.upper().isin(
-                [s.upper() for s in cst["estados_factura_invalidos"]]
-            )]
-            ok(f"Filtrado facturas inválidas. Quedan: {len(df)}")
+            resolved[key] = real
 
+        ok("Columnas críticas detectadas correctamente.")
 
-        # ---------------------------------------------------
-        # Crear columna combinada (si no existe)
-        # ---------------------------------------------------
-        if col["combinada"] in df.columns:
-            df["Combinada"] = df[col["combinada"]].astype(str)
-        else:
-            df["Combinada"] = df[col["serie"]].astype(str) + "-" + df[col["numero"]].astype(str)
-
-        # ---------------------------------------------------
-        # Limpieza y renombrado
-        # ---------------------------------------------------
+        # =======================================================
+        # Construcción dataframe limpio
+        # =======================================================
         df_clean = pd.DataFrame()
 
-        df_clean["RUC"] = df[col["ruc"]].astype(str).str.strip()
-        df_clean["Cliente_Generador"] = df[col["cliente_generador"]].astype(str).str.strip()
+        df_clean["RUC"] = df[resolved["ruc"]].astype(str).str.strip()
+        df_clean["Cliente_Generador"] = df[resolved["cliente_generador"]].astype(str).str.strip()
 
-        df_clean["Serie"] = df[col["serie"]].astype(str)
-        df_clean["Numero"] = df[col["numero"]].astype(str)
-        df_clean["Combinada"] = df["Combinada"].astype(str)
+        df_clean["Serie"] = df[resolved["serie"]].astype(str)
+        df_clean["Numero"] = df[resolved["numero"]].astype(str)
+        df_clean["Combinada"] = df_clean["Serie"] + "-" + df_clean["Numero"]
 
-        df_clean["Subtotal"] = pd.to_numeric(df[col["subtotal"]], errors="coerce").fillna(0)
+        df_clean["Subtotal"] = pd.to_numeric(df[resolved["subtotal"]], errors="coerce").fillna(0)
 
-        df_clean["Fecha_Emision"] = pd.to_datetime(df[col["fecha_emision"]], errors="coerce")
-        df_clean["Forma_Pago"] = df[col["forma_pago"]].astype(str).str.extract(r"(\d+)").fillna("0").astype(int)
+        df_clean["Fecha_Emision"] = pd.to_datetime(df[resolved["fecha_emision"]], errors="coerce")
+        df_clean["Forma_Pago"] = (
+            df[resolved["forma_pago"]].astype(str).str.extract(r"(\d+)").fillna("0").astype(int)
+        )
 
-        # Fecha Vencimiento (si existe)
+        # Opcionales
         if col["vencimiento"] in df.columns:
             df_clean["Vencimiento"] = pd.to_datetime(df[col["vencimiento"]], errors="coerce")
         else:
             df_clean["Vencimiento"] = None
 
-        # Estados
         df_clean["Estado_FS"] = df.get(col["estado_fs"], "DESCONOCIDO")
         df_clean["Estado_Cont"] = df.get(col["estado_cont"], "DESCONOCIDO")
 
@@ -167,13 +152,9 @@ class InvoicesExtractor:
         return df_clean
 
 
-
-# =======================================================
-#   TEST DIRECTO MANUAL (NO AUTOMÁTICO)
-# =======================================================
 if __name__ == "__main__":
-    info("🚀 Testeando extractor de facturas (solo carga y normaliza)...")
-    extractor = InvoicesExtractor()
-    df = extractor.load_invoices()
-    ok("Extracción de facturas completada.")
+    info("🚀 Test extractor facturas...")
+    e = InvoicesExtractor()
+    df = e.load_invoices()
     print(df.head())
+    ok("Test OK.")

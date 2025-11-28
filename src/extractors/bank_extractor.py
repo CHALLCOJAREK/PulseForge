@@ -5,15 +5,13 @@ import sys
 import pandas as pd
 from sqlalchemy import text
 
-# Acceso al núcleo del sistema
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 from src.core.db import get_db
 from src.core.env_loader import get_env
 
-# Prints Fénix
-def info(msg): print(f"🔵 {msg}")
-def ok(msg): print(f"🟢 {msg}")
-def warn(msg): print(f"🟡 {msg}")
+def info(msg):  print(f"🔵 {msg}")
+def ok(msg):    print(f"🟢 {msg}")
+def warn(msg):  print(f"🟡 {msg}")
 def error(msg): print(f"🔴 {msg}")
 
 
@@ -23,25 +21,17 @@ class BankExtractor:
         info("Inicializando extractor bancario…")
 
         self.env = get_env()
-        self.db = get_db()
+        self.db  = get_db()
 
-        # ========================
-        # Load settings
-        # ========================
         import json
         cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config"))
 
-        settings_path = os.path.join(cfg_dir, "settings.json")
+        settings_path  = os.path.join(cfg_dir, "settings.json")
         constants_path = os.path.join(cfg_dir, "constants.json")
-
-        if not os.path.exists(settings_path):
-            error(f"settings.json no encontrado en {settings_path}")
-            raise FileNotFoundError()
 
         with open(settings_path, "r", encoding="utf-8") as f:
             self.settings = json.load(f)
 
-        # constants.json opcional
         if os.path.exists(constants_path):
             with open(constants_path, "r", encoding="utf-8") as f:
                 self.constants = json.load(f)
@@ -53,31 +43,23 @@ class BankExtractor:
         ok("Extractor bancario listo.")
 
 
-    # =======================================
-    # Normalizador flexible de nombres
-    # =======================================
     @staticmethod
     def _norm(s):
-        return str(s).lower().replace(" ", "").replace("_", "").strip()
+        return str(s).lower().replace(" ", "").replace("_", "").replace("/", "").strip()
+
 
     def _find_col(self, df, configured_name):
-        """
-        Permite buscar columnas aunque vengan con:
-        - mayúsculas/minúsculas
-        - espacios
-        - guiones bajos
-        - variaciones leves
-        """
         if not configured_name:
             return None
-
+        
         target = self._norm(configured_name)
         mapa = {self._norm(c): c for c in df.columns}
 
+        # exact
         if target in mapa:
             return mapa[target]
 
-        # búsqueda parcial
+        # partial
         for norm, real in mapa.items():
             if target in norm or norm in target:
                 return real
@@ -85,9 +67,9 @@ class BankExtractor:
         return None
 
 
-    # =======================================
-    # Cargar tabla y normalizarla
-    # =======================================
+    # ============================================================
+    #  CARGA + NORMALIZACIÓN → DEVOLVER SOLO UNA COLUMNA "Fecha"
+    # ============================================================
     def _load_table(self, table_name, alias, moneda_fija):
         info(f"Cargando banco {alias} desde {table_name}")
 
@@ -101,7 +83,7 @@ class BankExtractor:
             warn(f"Tabla {table_name} vacía.")
             return pd.DataFrame()
 
-        # Leer columnas usando nombres configurados
+        # buscar columnas reales
         fecha        = self._find_col(df_raw, self.col.get("fecha"))
         tipo_mov     = self._find_col(df_raw, self.col.get("tipo_mov"))
         descripcion  = self._find_col(df_raw, self.col.get("descripcion"))
@@ -111,50 +93,41 @@ class BankExtractor:
         tipo_doc     = self._find_col(df_raw, self.col.get("tipo_documento"))
 
         if not fecha or not monto:
-            warn(f"{table_name}: faltan columnas mínimas.")
+            warn(f"{table_name}: faltan columnas mínimas para el procesamiento.")
             return pd.DataFrame()
 
         df = pd.DataFrame()
-        df["Banco"]         = alias
-        df["source_table"]  = table_name
-        df["origen_rowid"]  = df_raw["rowid"]
+        df["Banco"]        = alias
+        df["source_table"] = table_name
+        df["origen_rowid"] = df_raw["rowid"]
 
-        # Fecha
+        # 🔥 NORMALIZACIÓN ÚNICA DE FECHA
         df["Fecha"] = pd.to_datetime(df_raw[fecha], errors="coerce")
 
-        # Tipo de movimiento
-        if tipo_mov:
-            df["Tipo_Mov"] = df_raw[tipo_mov].astype(str).str.upper().str.strip()
-        else:
-            df["Tipo_Mov"] = ""
+        # tipo mov
+        df["Tipo_Mov"] = df_raw[tipo_mov].astype(str).str.upper().str.strip() if tipo_mov else ""
 
-        # Descripción
+        # descripción
         df["Descripcion"] = df_raw[descripcion].astype(str).str.strip() if descripcion else ""
 
-        # Monto (parse robusto)
-        df["Monto"] = (
-            df_raw[monto]
-            .astype(str)
-            .str.replace(".", "", regex=False)
+        # monto limpio
+        monto_series = df_raw[monto].astype(str)
+        monto_series = (monto_series
+            .str.replace(" ", "")
             .str.replace(",", ".", regex=False)
-        ).astype(float)
-
-        # Moneda fija por tabla
-        df["Moneda"] = moneda_fija
-
-        # N° operación
-        df["Operacion"] = df_raw[operacion].astype(str).str.strip() if operacion else ""
-
-        # Destinatario
-        df["Destinatario"] = df_raw[destinatario].astype(str).str.strip() if destinatario else ""
-
-        # Tipo de documento
-        df["Tipo_Documento"] = (
-            df_raw[tipo_doc].astype(str).str.upper().str.strip()
-            if tipo_doc else ""
+        )
+        monto_series = monto_series.apply(
+            lambda x: x if x.count(".") <= 1 else x.replace(".", "", x.count(".") - 1)
         )
 
-        # Filtrar montos cero (según constants.json)
+        df["Monto"] = pd.to_numeric(monto_series, errors="coerce").fillna(0)
+
+        df["Moneda"] = moneda_fija
+        df["Operacion"] = df_raw[operacion].astype(str).str.strip() if operacion else ""
+        df["Destinatario"] = df_raw[destinatario].astype(str).str.strip() if destinatario else ""
+        df["Tipo_Documento"] = df_raw[tipo_doc].astype(str).str.upper().str.strip() if tipo_doc else ""
+
+        # filtro de montos cero
         if not self.constants.get("considerar_montos_cero", False):
             df = df[df["Monto"] != 0]
 
@@ -162,10 +135,10 @@ class BankExtractor:
         return df
 
 
-    # =======================================
-    # Unificar TODOS los bancos
-    # =======================================
-    def get_all(self):
+    # ============================================================
+    # MÉTODO FINAL PARA EL PIPELINE
+    # ============================================================
+    def get_todos_movimientos(self):
         info("Unificando movimientos bancarios…")
 
         t = self.settings["tablas"]
@@ -181,6 +154,7 @@ class BankExtractor:
         ]
 
         dfs = []
+
         for key, alias, moneda in bancos_cfg:
             tbl = t.get(key)
             if not tbl:
@@ -196,17 +170,14 @@ class BankExtractor:
             return pd.DataFrame()
 
         df_final = pd.concat(dfs, ignore_index=True)
+
+        # 🔥 BORRAR CUALQUIER OTRA COLUMNA FECHA QUE SE HAYA PEGADO
+        for c in df_final.columns:
+            if c.lower() in ["fecha_mov", "fechaoriginal", "fecha_ope", "fecha_trans"]:
+                if c != "Fecha":
+                    df_final.drop(columns=[c], inplace=True)
+
         df_final = df_final.sort_values(by=["Fecha", "Banco", "Monto"])
 
         ok(f"Total movimientos unificados: {len(df_final)}")
         return df_final
-
-
-# =======================================
-# Test manual rápido
-# =======================================
-if __name__ == "__main__":
-    info("🔧 Test extractor bancario")
-    ex = BankExtractor()
-    df = ex.get_all()
-    print(df.head())

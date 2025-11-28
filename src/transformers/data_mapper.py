@@ -4,31 +4,20 @@ import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
 import pandas as pd
-from src.core.env_loader import get_env
 from json import load
+from src.core.env_loader import get_env
 
-# Prints estilo Fénix
 def info(msg): print(f"🔵 {msg}")
-def ok(msg): print(f"🟢 {msg}")
+def ok(msg):   print(f"🟢 {msg}")
 def warn(msg): print(f"🟡 {msg}")
 def error(msg): print(f"🔴 {msg}")
 
 
 class DataMapper:
-    """
-    Estandariza TODA la data que viene de:
-      - Extractor de clientes
-      - Extractor de facturas
-      - Extractor de bancos
-
-    El objetivo es que el Calculator y el Matcher NO dependan
-    de nombres reales de columnas.
-    """
 
     def __init__(self):
         self.env = get_env()
 
-        # Cargar settings.json
         settings_path = os.path.abspath(
             os.path.join(os.path.dirname(__file__), "../../config/settings.json")
         )
@@ -43,16 +32,10 @@ class DataMapper:
         ok("DataMapper inicializado correctamente.")
 
 
-
     # =======================================================
-    #   MAPEO DE CLIENTES
+    # MAPEO DE CLIENTES
     # =======================================================
     def map_clientes(self, df_clientes: pd.DataFrame):
-        """
-        Devuelve:
-        RUC - string
-        Razon_Social - string
-        """
         info("Normalizando clientes...")
 
         df = df_clientes.copy()
@@ -64,145 +47,86 @@ class DataMapper:
         return df
 
 
-
     # =======================================================
-    #   MAPEO DE FACTURAS
+    # MAPEO DE FACTURAS
     # =======================================================
     def map_facturas(self, df_fact: pd.DataFrame):
-        """
-        Devuelve DataFrame estandarizado:
-
-            ruc
-            cliente_generador
-            subtotal
-            serie
-            numero
-            combinada
-            estado_fs
-            estado_cont
-            fecha_emision (datetime)
-            forma_pago (int)
-            vencimiento (datetime)
-        """
-
         info("Normalizando facturas...")
 
-        col = self.settings["columnas_facturas"]
         df = df_fact.copy()
+        df_std = pd.DataFrame()
 
-        # Asegurar strings limpios
-        df[col["serie"]] = df[col["serie"]].astype(str).str.strip()
-        df[col["numero"]] = df[col["numero"]].astype(str).str.strip()
-        df[col["ruc"]]    = df[col["ruc"]].astype(str).str.strip()
+        df_std["ruc"]               = df["RUC"].astype(str).str.strip()
+        df_std["cliente_generador"] = df["Cliente_Generador"].astype(str).str.strip()
+        df_std["subtotal"]          = df["Subtotal"]
+        df_std["serie"]             = df["Serie"].astype(str).str.strip()
+        df_std["numero"]            = df["Numero"].astype(str).str.strip()
+        df_std["combinada"]         = df["Combinada"].astype(str)
 
-        # Fecha de emisión → datetime
-        df["fecha_emision"] = pd.to_datetime(df[col["fecha_emision"]], errors="coerce")
+        df_std["estado_fs"]   = df["Estado_FS"].astype(str).str.lower().str.strip()
+        df_std["estado_cont"] = df["Estado_Cont"].astype(str).str.lower().str.strip()
 
-        # Forma de pago → int
-        df["forma_pago"] = pd.to_numeric(df[col["forma_pago"]], errors="coerce").fillna(0).astype(int)
+        df_std["fecha_emision"] = pd.to_datetime(df["Fecha_Emision"], errors="coerce")
+        df_std["forma_pago"]    = df["Forma_Pago"]
+        df_std["Vencimiento"]   = df["Vencimiento"]
 
-        # Subtotal → número
-        df["subtotal"] = pd.to_numeric(df[col["subtotal"]], errors="coerce")
-
-        # Estado FS y CONT
-        df["estado_fs"] = df[col["estado_fs"]].astype(str).str.lower().str.strip()
-        df["estado_cont"] = df[col["estado_cont"]].astype(str).str.lower().str.strip()
-
-        # Cliente generador
-        df["cliente_generador"] = df[col["cliente_generador"]].astype(str).str.strip()
-
-        # Combinada
-        df["combinada"] = df[col["serie"]].astype(str) + "-" + df[col["numero"]].astype(str)
-
-        # Vencimiento a datetime
-        df["vencimiento"] = pd.to_datetime(df[col["vencimiento"]], errors="coerce")
-
-        ok(f"Facturas normalizadas: {len(df)} registros.")
-        return df[
-            [
-                "ruc",
-                "cliente_generador",
-                "subtotal",
-                col["serie"],
-                col["numero"],
-                "combinada",
-                "estado_fs",
-                "estado_cont",
-                "fecha_emision",
-                "forma_pago",
-                "vencimiento",
-            ]
-        ]
-
+        ok(f"Facturas normalizadas: {len(df_std)} registros.")
+        return df_std
 
 
     # =======================================================
-    #   MAPEO DE BANCOS
+    # MAPEO DE BANCOS (COMPATIBLE CON MATCHER ULTRA-BLINDADO)
     # =======================================================
     def map_bancos(self, df_banco: pd.DataFrame):
-        """
-        Devuelve DataFrame estandarizado:
-
-            banco
-            fecha_mov
-            tipo_mov
-            descripcion
-            serie
-            numero
-            monto
-            moneda
-            operacion
-            destinatario
-            tipo_documento
-        """
-
         info("Normalizando movimientos bancarios...")
 
-        col = self.settings["columnas_bancos"]
         df = df_banco.copy()
 
-        # Fecha movimiento → datetime
-        df["fecha_mov"] = pd.to_datetime(df[col["fecha"]], errors="coerce")
+        # ——————————————————————————————
+        # DETECCIÓN DE FECHA
+        # ——————————————————————————————
+        fecha_vars = [c for c in df.columns if "fecha" in c.lower()]
+        if not fecha_vars:
+            error("No existe columna Fecha en bancos.")
+            raise KeyError("df_banco NO contiene columna Fecha")
 
-        # Serie / número → str
-        df["serie"] = df[col["serie"]].astype(str).str.strip() if col["serie"] in df else ""
-        df["numero"] = df[col["numero"]].astype(str).str.strip() if col["numero"] in df else ""
+        col_fecha = fecha_vars[0]
+        df["Fecha"] = pd.to_datetime(df[col_fecha], errors="coerce")
 
-        # Monto → numérico
-        df["monto"] = pd.to_numeric(df[col["monto"]], errors="coerce").fillna(0)
+        # ——————————————————————————————
+        # RENOMBRAR TODAS LAS COLUMNAS
+        # ——————————————————————————————
+        col_map = {
+            "Banco": "Banco",
+            "Tipo_Mov": "tipo_mov",
+            "Descripcion": "Descripcion",     # <-- AHORA ENVIAMOS EXACTO LO QUE EL MATCHER REQUIERE
+            "Monto": "Monto",
+            "Moneda": "Moneda",
+            "Operacion": "Operacion",
+            "Destinatario": "destinatario",
+            "Tipo_Documento": "tipo_documento"
+        }
 
-        # Moneda → string normalizado
-        df["moneda"] = df[col["moneda"]].astype(str).str.upper().str.strip()
+        df_std = pd.DataFrame()
 
-        # Tipo movimiento
-        df["tipo_mov"] = df[col["tipo_mov"]].astype(str).str.upper().str.strip()
+        for old, new in col_map.items():
+            if old in df.columns:
+                df_std[new] = df[old]
+            else:
+                df_std[new] = ""
 
-        # Descripción
-        df["descripcion"] = df[col["descripcion"]].astype(str).str.strip()
+        df_std["Fecha"] = df["Fecha"]
 
-        # Operación
-        df["operacion"] = df[col["operacion"]].astype(str).str.strip()
+        ok(f"Movimientos bancarios normalizados: {len(df_std)} registros.")
 
-        # Destinatario
-        df["destinatario"] = df[col["destinatario"]].astype(str).str.strip()
-
-        # Tipo de documento
-        df["tipo_documento"] = df[col["tipo_documento"]].astype(str).str.upper().str.strip()
-
-        ok(f"Movimientos bancarios normalizados: {len(df)} registros.")
-
-        return df[
-            [
-                "Banco",
-                "fecha_mov",
-                "tipo_mov",
-                "descripcion",
-                "serie",
-                "numero",
-                "monto",
-                "moneda",
-                "operacion",
-                "destinatario",
-                "tipo_documento"
-            ]
-        ]
+        return df_std[[
+            "Banco",
+            "Fecha",
+            "tipo_mov",
+            "Descripcion",   # 🔥 YA ES COMPATIBLE
+            "Monto",
+            "Moneda",
+            "Operacion",
+            "destinatario",
+            "tipo_documento"
+        ]]
