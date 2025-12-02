@@ -1,153 +1,107 @@
 # src/pipelines/full_run.py
+from __future__ import annotations
 
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+# ============================================================
+#  PULSEFORGE · FULL RUN PIPELINE (EJECUCIÓN COMPLETA)
+#  Corre TODOS los pipelines en la secuencia correcta:
+#     1) Clientes
+#     2) Facturas
+#     3) Bancos
+#     4) Matcher
+# ============================================================
 
-# ========== EXTRACTORS ==========
-from src.extractors.clients_extractor import ClientsExtractor
-from src.extractors.invoices_extractor import InvoicesExtractor
-from src.extractors.bank_extractor import BankExtractor
+import sys
+from pathlib import Path
 
-# ========== TRANSFORMERS ==========
-from src.transformers.data_mapper import DataMapper
-from src.transformers.calculator import Calculator
-from src.transformers.matcher import Matcher
+# Bootstrap rutas
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
-# ========== LOADERS ==========
-from src.loaders.newdb_builder import NewDBBuilder
-from src.loaders.invoice_writer import InvoiceWriter
-from src.loaders.match_writer import MatchWriter
-
-# ========== UTILS ==========
+from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
 
-
-def info(msg): print(f"🔵 {msg}")
-def ok(msg): print(f"🟢 {msg}")
-def warn(msg): print(f"🟡 {msg}")
-def error(msg): print(f"🔴 {msg}")
-
-
-# =======================================================
-#   FULL RUN · PULSEFORGE · ENTERPRISE MODE
-# =======================================================
-def full_run():
-    info("🚀 FULL RUN — PulseForge iniciando...")
-
-    env = get_env()
-
-    # =======================================================
-    #   0) CONSTRUIR BD DESTINO
-    # =======================================================
-    info("🏗️ Construyendo estructura pulseforge.sqlite...")
-    builder = NewDBBuilder()
-    builder.crear_tablas()
-
-    invoice_writer = InvoiceWriter()
-    match_writer   = MatchWriter()
-
-    info("🧹 Limpiando tablas destino (modo FULL)...")
-    invoice_writer.limpiar_tabla()
-    match_writer.limpiar_tabla()
-
-    # =======================================================
-    #   1) EXTRACTION
-    # =======================================================
-    info("📥 Extrayendo clientes...")
-    clientes_df = ClientsExtractor().get_client_data()
-    if clientes_df.empty:
-        warn("Clientes vacío.")
-
-    info("📥 Extrayendo facturas...")
-    facturas_df = InvoicesExtractor().load_invoices()
-    if facturas_df.empty:
-        error("❌ No se encontraron facturas. FULL RUN abortado.")
-        return None
-
-    info("📥 Extrayendo movimientos bancarios...")
-    bancos_df = BankExtractor().get_todos_movimientos()
-    if bancos_df.empty:
-        warn("⚠️ No hay movimientos bancarios.")
-
-    # =======================================================
-    #   LIMPIEZA GLOBAL PRE-MAPPING
-    # =======================================================
-    info("🧽 Normalizando nombres de columnas globales...")
-
-    def clean_cols(df):
-        df.columns = [str(c).strip().replace("\n", "").replace("\r", "") for c in df.columns]
-        return df
-
-    clientes_df = clean_cols(clientes_df)
-    facturas_df = clean_cols(facturas_df)
-    bancos_df   = clean_cols(bancos_df)
-
-    # =======================================================
-    #   2) MAPPING
-    # =======================================================
-    mapper = DataMapper()
-
-    info("🔄 Mapeando clientes...")
-    clientes_m = mapper.map_clientes(clientes_df)
-
-    info("🔄 Mapeando facturas...")
-    facturas_m = mapper.map_facturas(facturas_df)
-
-    info("🔄 Mapeando movimientos bancarios (blindado)...")
-    bancos_m = mapper.map_bancos(bancos_df)
-
-    # =======================================================
-    #   3) CALCULATOR
-    # =======================================================
-    info("🧮 Ejecutando cálculos financieros...")
-    calc = Calculator()
-
-    facturas_calc = calc.process_facturas(facturas_m)
-    bancos_calc   = calc.process_bancos(bancos_m)
-
-    # =======================================================
-    #   VALIDACIONES ANTES DEL MATCH
-    # =======================================================
-    if "fecha_mov" not in bancos_calc.columns and "Fecha" not in bancos_calc.columns:
-        warn("⚠️ WARNING: bancos_calc no trae columna Fecha. El matcher la reconstruirá.")
-
-    if "Banco" not in bancos_calc.columns:
-        warn("⚠️ WARNING: bancos_calc no trae Banco. Intentaremos detectar columnas equivalentes.")
-
-    # =======================================================
-    #   4) MATCHER
-    # =======================================================
-    info("🧩 Matching iniciado...")
-    matcher = Matcher()
-    matches_df = matcher.match(facturas_calc, bancos_calc)
-
-    # =======================================================
-    #   5) LOADERS
-    # =======================================================
-    info("📤 Guardando facturas en la BD destino...")
-    invoice_writer.escribir_facturas(facturas_calc)
-
-    info("📤 Guardando matches en la BD destino...")
-    match_writer.escribir_matches(matches_df)
-
-    # =======================================================
-    #   6) RESUMEN FINAL
-    # =======================================================
-    ok("🎯 FULL RUN completado correctamente.")
-
-    print("\n================= RESULTADO FINAL =================")
-    print(f"Facturas procesadas:        {len(facturas_calc)}")
-    print(f"Movimientos bancarios:      {len(bancos_calc)}")
-    print(f"Matches generados:          {len(matches_df)}")
-    print("===================================================\n")
-
-    return {
-        "clientes": clientes_m,
-        "facturas": facturas_calc,
-        "bancos": bancos_calc,
-        "matches": matches_df
-    }
+# Pipelines individuales
+from src.pipelines.pipeline_clients import PipelineClients
+from src.pipelines.pipeline_facturas import PipelineFacturas
+from src.pipelines.pipeline_bancos import PipelineBancos
+from src.pipelines.pipeline_matcher import PipelineMatcher
 
 
+# ============================================================
+#  FULL RUN PIPELINE
+# ============================================================
+class FullRun:
+
+    def __init__(self):
+        info("Inicializando FullRun Pipeline…")
+
+        # Inicializar sub-pipelines
+        self.p_clients = PipelineClients()
+        self.p_facturas = PipelineFacturas()
+        self.p_bancos = PipelineBancos()
+        self.p_matcher = PipelineMatcher()
+
+        ok("FullRun inicializado correctamente.")
+
+    # --------------------------------------------------------
+    def run(self, reset: bool = False) -> None:
+        """
+        Ejecuta TODO PulseForge en orden ideal.
+        Si reset=True → limpia cada tabla antes de cargar.
+        """
+
+        info("🚀 Iniciando ejecución completa de PulseForge…")
+        if reset:
+            warn("RESET GLOBAL ACTIVADO → todas las tablas se limpiarán antes de cargar.")
+
+        # 1) CLIENTES
+        info("📂 [1/4] Procesando clientes…")
+        try:
+            n1 = self.p_clients.run(reset=reset)
+            ok(f"[FULL_RUN] Clientes procesados: {n1}")
+        except Exception as e:
+            error(f"[FULL_RUN] Error procesando clientes: {e}")
+            return
+
+        # 2) FACTURAS
+        info("📄 [2/4] Procesando facturas…")
+        try:
+            n2 = self.p_facturas.run(reset=reset)
+            ok(f"[FULL_RUN] Facturas procesadas: {n2}")
+        except Exception as e:
+            error(f"[FULL_RUN] Error procesando facturas: {e}")
+            return
+
+        # 3) BANCOS
+        info("🏦 [3/4] Procesando movimientos bancarios…")
+        try:
+            n3 = self.p_bancos.run(reset=reset)
+            ok(f"[FULL_RUN] Movimientos bancarios procesados: {n3}")
+        except Exception as e:
+            error(f"[FULL_RUN] Error procesando bancos: {e}")
+            return
+
+        # 4) MATCHER
+        info("🤖 [4/4] Ejecutando matcher…")
+        try:
+            n4 = self.p_matcher.run()
+            ok(f"[FULL_RUN] Matches generados: {n4}")
+        except Exception as e:
+            error(f"[FULL_RUN] Error ejecutando matcher: {e}")
+            return
+
+        ok("🔥 FULL RUN COMPLETADO EXITOSAMENTE 🔥")
+
+
+# ============================================================
+#  TEST LOCAL
+# ============================================================
 if __name__ == "__main__":
-    full_run()
+    try:
+        info("⚙️ Test local de FullRun Pipeline…")
+        fr = FullRun()
+        fr.run(reset=True)
+        ok("Test de FullRun OK.")
+    except Exception as e:
+        error(f"Fallo en test de FullRun: {e}")

@@ -1,161 +1,218 @@
 # src/extractors/clients_extractor.py
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from __future__ import annotations
+
+# ============================================================
+#  EXTRACTOR DE CLIENTES · PULSEFORGE · SQLITE
+# ============================================================
+import sys
+import sqlite3
+from pathlib import Path
+from typing import Optional
 
 import pandas as pd
-from sqlalchemy import text
 
-from src.core.db import get_db
+# ------------------------------------------------------------
+#  BOOTSTRAP RUTAS
+# ------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
+from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
-
-# Prints estilo Fénix
-def info(msg): print(f"🔵 {msg}")
-def ok(msg): print(f"🟢 {msg}")
-def warn(msg): print(f"🟡 {msg}")
-def error(msg): print(f"🔴 {msg}")
+from src.transformers.data_mapper import DataMapper
 
 
+# ============================================================
+#  HELPERS DE CONEXIÓN
+# ============================================================
+def _get_sqlite_connection() -> sqlite3.Connection:
+    """
+    Abre conexión SQLite a la BD origen indicada en PULSEFORGE_DB_PATH.
+    Solo soporta tipo 'sqlite' (PULSEFORGE_DB_TYPE).
+    """
+    db_type = str(get_env("PULSEFORGE_DB_TYPE", default="sqlite")).strip().lower()
+    if db_type != "sqlite":
+        error(f"PULSEFORGE_DB_TYPE='{db_type}' no soportado. Solo 'sqlite' por ahora.")
+        raise ValueError("Tipo de base de datos no soportado. Use 'sqlite'.")
+
+    db_path = str(get_env("PULSEFORGE_DB_PATH")).strip()
+    if not db_path:
+        error("PULSEFORGE_DB_PATH no configurado en .env")
+        raise ValueError("Falta PULSEFORGE_DB_PATH en configuración.")
+
+    db_file = Path(db_path)
+    if not db_file.exists():
+        error(f"Base de datos origen no encontrada: {db_file}")
+        raise FileNotFoundError(f"No existe la BD origen: {db_file}")
+
+    info(f"Conectando a BD origen SQLite → {db_file}")
+    return sqlite3.connect(db_file)
+
+
+# ============================================================
+#  EXTRACTOR DE CLIENTES
+# ============================================================
 class ClientsExtractor:
     """
-    Extrae razón social desde la tabla de clientes.
-    Basado en:
-    - settings.json → tabla de origen
-    - constants.json → nombres posibles y reglas
+    Extrae clientes desde la BD origen (DataPulse) y devuelve un
+    DataFrame normalizado con columnas estándar para PulseForge:
+
+        ['RUC', 'Razon_Social']
+
+    Luego DataMapper termina de pulir el formato.
     """
 
-    def __init__(self):
-        self.env = get_env()
-        self.db = get_db()
+    def __init__(self) -> None:
+        info("Inicializando ClientsExtractor…")
+        self.mapper = DataMapper()
+        self._tabla_clientes = self._resolve_tabla_clientes()
+        ok(f"ClientsExtractor listo. Tabla clientes = '{self._tabla_clientes}'")
 
-        info("Inicializando extractor de clientes...")
+    # --------------------------------------------------------
+    #  RESOLVER NOMBRE DE TABLA DESDE settings.json
+    # --------------------------------------------------------
+    def _resolve_tabla_clientes(self) -> str:
+        tablas_cfg = self.mapper.settings.get("tablas", {})
+        tabla = tablas_cfg.get("clientes")
 
-        # -------------------------------
-        # Cargar settings.json
-        # -------------------------------
-        from json import load
+        if not tabla:
+            error("No se encontró 'clientes' dentro de settings['tablas'].")
+            raise KeyError("Falta configuración de tabla 'clientes' en settings.json")
 
-        settings_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../config/settings.json")
-        )
-        if not os.path.exists(settings_path):
-            error(f"No se encontró settings.json en: {settings_path}")
-            raise FileNotFoundError("settings.json no encontrado")
+        return str(tabla)
 
-        with open(settings_path, "r", encoding="utf-8") as f:
-            self.settings = load(f)
-
-
-        # -------------------------------
-        # Cargar constants.json (palabras clave opcionales)
-        # -------------------------------
-        constants_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../config/constants.json")
-        )
-        if not os.path.exists(constants_path):
-            warn("⚠ No se encontró constants.json. Continuando sin él.")
-            self.constants = {}
-        else:
-            with open(constants_path, "r", encoding="utf-8") as f:
-                self.constants = load(f)
-
-        ok("Extractor de clientes listo para trabajar.")
-
-
-
-    # =======================================================
-    #   CARGAR TABLA COMPLETA DESDE SQL
-    # =======================================================
-    def _load_clients_table(self):
-        tabla = self.settings["tablas"]["clientes"]
-        info(f"Cargando tabla de clientes: {tabla}")
-
-        query = text(f"SELECT * FROM {tabla}")
-
+    # --------------------------------------------------------
+    #  LECTURA CRUDA DESDE SQLITE
+    # --------------------------------------------------------
+    def _load_raw_clientes(self) -> pd.DataFrame:
+        """
+        Lee la tabla de clientes cruda desde SQLite.
+        """
+        conn = _get_sqlite_connection()
         try:
-            df = pd.read_sql(query, self.db.engine_origen)
+            info(f"Leyendo clientes desde tabla SQLite '{self._tabla_clientes}'…")
+            query = f'SELECT * FROM "{self._tabla_clientes}"'
+            df = pd.read_sql_query(query, conn)
+
+            if df.empty:
+                warn("La tabla de clientes está vacía.")
+            else:
+                ok(f"Clientes crudos leídos: {len(df)} filas.")
+
+            return df
+
         except Exception as e:
-            error(f"Error leyendo tabla de clientes: {e}")
+            error(f"Error leyendo tabla de clientes '{self._tabla_clientes}': {e}")
             raise
+        finally:
+            conn.close()
 
-        ok(f"Registros de clientes cargados: {len(df)}")
-        return df
-
-
-
-    # =======================================================
-    #   BUSCAR COLUMNA DE MANERA INTELIGENTE
-    # =======================================================
+    # --------------------------------------------------------
+    #  NORMALIZAR COLUMNAS (RUC / Razon_Social)
+    # --------------------------------------------------------
     @staticmethod
-    def _find_column(df, possible_names):
+    def _normalize_clientes_columns(df: pd.DataFrame) -> pd.DataFrame:
         """
-        Encuentra la columna correcta aunque:
-        - tenga mayúsculas
-        - tenga espacios variados
-        - tenga slash
-        - venga pésimamente escrita
+        Intenta detectar de forma robusta las columnas de RUC y Razón Social
+        y las normaliza a:
+
+            'RUC'         → texto, sin espacios
+            'Razon_Social'→ texto, sin espacios
+
+        Esta función NO usa IA, aquí todo es determinista.
+        La IA se usa después en el matcher para similitudes.
         """
-        normalized = {col.lower().strip(): col for col in df.columns}
+        if df.empty:
+            warn("DataFrame de clientes vacío en normalización.")
+            return pd.DataFrame(columns=["RUC", "Razon_Social"])
 
-        for name in possible_names:
-            clean = name.lower().strip()
-            if clean in normalized:
-                return normalized[clean]
+        df_norm = df.copy()
+        cols_lower = {c.lower().strip(): c for c in df_norm.columns}
 
-        return None
+        # -------- Detectar columna de RUC --------
+        candidatos_ruc = [
+            "ruc", "ruc_cliente", "num_doc", "nro_doc", "numero_documento",
+            "doc", "nrodocumento"
+        ]
+        col_ruc: Optional[str] = None
 
-
-
-    # =======================================================
-    #   PROCESO PRINCIPAL
-    # =======================================================
-    def get_client_data(self):
-        df = self._load_clients_table()
-
-        # Nombres que sí vienen en tu BD (te los puse exactos)
-        possible_ruc_names = {
-            "ruc / dni", "ruc/dni", "ruc", "dni_ruc", "ruc dni"
-        }
-
-        possible_rs_names = {
-            "razon social", "razón social", "razon_social", 
-            "razon", "nombre", "cliente"
-        }
-
-        col_ruc = self._find_column(df, possible_ruc_names)
-        col_rs  = self._find_column(df, possible_rs_names)
+        for k in candidatos_ruc:
+            if k in cols_lower:
+                col_ruc = cols_lower[k]
+                break
 
         if not col_ruc:
-            error("❌ No se encontró la columna del RUC en la tabla de clientes.")
-            raise KeyError("Columna RUC no encontrada.")
+            for c in df_norm.columns:
+                if "ruc" in c.lower():
+                    col_ruc = c
+                    break
+
+        if not col_ruc:
+            error("No se pudo identificar columna RUC en clientes.")
+            raise KeyError("No se encontró columna de RUC en clientes.")
+
+        # -------- Detectar columna de Razón Social --------
+        candidatos_rs = [
+            "razon_social", "razón_social", "razon social",
+            "nombre_razon_social", "nombre / razón social",
+            "nombre", "cliente", "proveedor"
+        ]
+        col_rs: Optional[str] = None
+
+        for k in candidatos_rs:
+            if k in cols_lower:
+                col_rs = cols_lower[k]
+                break
 
         if not col_rs:
-            error("❌ No se encontró la columna de Razón Social.")
-            raise KeyError("Columna Razón Social no encontrada.")
+            for c in df_norm.columns:
+                cl = c.lower()
+                if "razon" in cl or "razón" in cl or "nombre" in cl:
+                    col_rs = c
+                    break
 
-        ok(f"Columna RUC detectada como: {col_ruc}")
-        ok(f"Columna Razón Social detectada como: {col_rs}")
+        if not col_rs:
+            error("No se pudo identificar columna Razón Social en clientes.")
+            raise KeyError("No se encontró columna de Razón Social en clientes.")
 
-        # ---------------------------------------------------
-        # Limpieza final
-        # ---------------------------------------------------
-        df_clean = df[[col_ruc, col_rs]].copy()
-        df_clean.columns = ["RUC", "Razon_Social"]
+        info(f"Columna RUC detectada → '{col_ruc}'")
+        info(f"Columna Razón Social detectada → '{col_rs}'")
 
-        df_clean["RUC"] = df_clean["RUC"].astype(str).str.strip()
-        df_clean["Razon_Social"] = df_clean["Razon_Social"].astype(str).str.strip()
+        out = pd.DataFrame()
+        out["RUC"] = df_norm[col_ruc].astype(str).str.strip()
+        out["Razon_Social"] = df_norm[col_rs].astype(str).str.strip()
 
-        info("Vista previa de clientes normalizados:")
-        print(df_clean.head())
+        ok("Clientes normalizados a esquema estándar (RUC / Razon_Social).")
+        return out
 
-        return df_clean
+    # --------------------------------------------------------
+    #  API PÚBLICA
+    # --------------------------------------------------------
+    def get_clientes_mapeados(self) -> pd.DataFrame:
+        """
+        Devuelve un DataFrame ya normalizado por DataMapper:
+
+            ['RUC', 'Razon_Social']
+
+        Listo para integrarse con el resto de PulseForge.
+        """
+        df_raw = self._load_raw_clientes()
+        df_norm = self._normalize_clientes_columns(df_raw)
+        df_mapped = self.mapper.map_clientes(df_norm)
+
+        ok(f"Clientes mapeados OK: {len(df_mapped)} registros.")
+        return df_mapped
 
 
-
-# =======================================================
-#   TEST DIRECTO MANUAL
-# =======================================================
+# ============================================================
+#  TEST LOCAL RÁPIDO
+# ============================================================
 if __name__ == "__main__":
-    info("🚀 Testeando extractor de clientes (solo carga y mapeo)...")
-    extractor = ClientsExtractor()
-    df = extractor.get_client_data()
-    ok("Extracción completada correctamente.")
+    try:
+        ce = ClientsExtractor()
+        df_cli = ce.get_clientes_mapeados()
+        print(df_cli.head())
+        ok("Test rápido de ClientsExtractor completado.")
+    except Exception as e:
+        error(f"Fallo en test de ClientsExtractor: {e}")

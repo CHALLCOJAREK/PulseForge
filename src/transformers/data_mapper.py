@@ -1,108 +1,131 @@
 # src/transformers/data_mapper.py
+from __future__ import annotations
 
-import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-
+# ============================================================
+#  BOOTSTRAP RUTAS
+# ============================================================
+import os
+import sys
 import pandas as pd
+from pathlib import Path
 from json import load
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
+from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
 
-def info(msg): print(f"🔵 {msg}")
-def ok(msg):   print(f"🟢 {msg}")
-def warn(msg): print(f"🟡 {msg}")
-def error(msg): print(f"🔴 {msg}")
 
-
+# ============================================================
+#  DATA MAPPER CORPORATIVO · PULSEFORGE V2
+# ============================================================
 class DataMapper:
 
     def __init__(self):
-        self.env = get_env()
+        info("Inicializando DataMapper PulseForge…")
 
-        settings_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "../../config/settings.json")
-        )
-
-        if not os.path.exists(settings_path):
-            error("settings.json no encontrado. DataMapper no puede iniciar.")
+        # Cargar settings.json
+        config_path = ROOT / "config" / "settings.json"
+        if not config_path.exists():
+            error("settings.json no encontrado — DataMapper NO puede iniciar.")
             raise FileNotFoundError("settings.json no encontrado")
 
-        with open(settings_path, "r", encoding="utf-8") as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             self.settings = load(f)
 
-        ok("DataMapper inicializado correctamente.")
+        ok("DataMapper cargado correctamente.")
 
 
-    # =======================================================
-    # MAPEO DE CLIENTES
-    # =======================================================
-    def map_clientes(self, df_clientes: pd.DataFrame):
-        info("Normalizando clientes...")
+    # ============================================================
+    #  CLIENTES
+    # ============================================================
+    def map_clientes(self, df: pd.DataFrame) -> pd.DataFrame:
+        info("Normalizando clientes…")
 
-        df = df_clientes.copy()
+        df = df.copy()
 
         df["RUC"] = df["RUC"].astype(str).str.strip()
         df["Razon_Social"] = df["Razon_Social"].astype(str).str.strip()
 
-        ok(f"Clientes normalizados: {len(df)} registrados.")
-        return df
+        ok(f"Clientes normalizados: {len(df)} registros.")
+
+        return df[["RUC", "Razon_Social"]]
 
 
-    # =======================================================
-    # MAPEO DE FACTURAS
-    # =======================================================
-    def map_facturas(self, df_fact: pd.DataFrame):
-        info("Normalizando facturas...")
+    # ============================================================
+    #  FACTURAS
+    # ============================================================
+    def map_facturas(self, df: pd.DataFrame) -> pd.DataFrame:
+        info("Normalizando facturas…")
 
-        df = df_fact.copy()
+        df = df.copy()
+
         df_std = pd.DataFrame()
 
-        df_std["ruc"]               = df["RUC"].astype(str).str.strip()
+        # ID base
+        df_std["ruc"] = df["RUC"].astype(str).str.strip()
         df_std["cliente_generador"] = df["Cliente_Generador"].astype(str).str.strip()
-        df_std["subtotal"]          = df["Subtotal"]
-        df_std["serie"]             = df["Serie"].astype(str).str.strip()
-        df_std["numero"]            = df["Numero"].astype(str).str.strip()
-        df_std["combinada"]         = df["Combinada"].astype(str)
 
-        df_std["estado_fs"]   = df["Estado_FS"].astype(str).str.lower().str.strip()
+        # Monto base
+        df_std["subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce")
+
+        df_std["serie"] = df["Serie"].astype(str).str.strip()
+        df_std["numero"] = df["Numero"].astype(str).str.strip()
+        df_std["combinada"] = df["Combinada"].astype(str).str.strip()
+
+        # Estados administrativos
+        df_std["estado_fs"] = df["Estado_FS"].astype(str).str.lower().str.strip()
         df_std["estado_cont"] = df["Estado_Cont"].astype(str).str.lower().str.strip()
 
+        # Fechas
         df_std["fecha_emision"] = pd.to_datetime(df["Fecha_Emision"], errors="coerce")
-        df_std["forma_pago"]    = df["Forma_Pago"]
-        df_std["Vencimiento"]   = df["Vencimiento"]
+        df_std["fecha_limite_pago"] = pd.to_datetime(df["Vencimiento"], errors="coerce")
+
+        # Ventanas dinámicas (procesadas después por calculator)
+        df_std["fecha_inicio_ventana"] = None
+        df_std["fecha_fin_ventana"] = None
+
+        # Valores derivados — se llenan después por calculator
+        df_std["neto_recibido"] = None
+        df_std["total_con_igv"] = None
+        df_std["detraccion_monto"] = None
 
         ok(f"Facturas normalizadas: {len(df_std)} registros.")
+
         return df_std
 
 
-    # =======================================================
-    # MAPEO DE BANCOS (COMPATIBLE CON MATCHER ULTRA-BLINDADO)
-    # =======================================================
-    def map_bancos(self, df_banco: pd.DataFrame):
-        info("Normalizando movimientos bancarios...")
+    # ============================================================
+    #  BANCOS — COMPATIBLE CON MATCHER ULTRA-BLINDADO
+    # ============================================================
+    def map_bancos(self, df: pd.DataFrame) -> pd.DataFrame:
+        info("Normalizando movimientos bancarios…")
 
-        df = df_banco.copy()
+        df = df.copy()
 
-        # ——————————————————————————————
-        # DETECCIÓN DE FECHA
-        # ——————————————————————————————
+        # -------------------------------------------
+        # 1) Detección automática de columna Fecha
+        # -------------------------------------------
         fecha_vars = [c for c in df.columns if "fecha" in c.lower()]
         if not fecha_vars:
             error("No existe columna Fecha en bancos.")
-            raise KeyError("df_banco NO contiene columna Fecha")
+            raise KeyError("df_banco no contiene columna de fecha")
 
         col_fecha = fecha_vars[0]
         df["Fecha"] = pd.to_datetime(df[col_fecha], errors="coerce")
 
-        # ——————————————————————————————
-        # RENOMBRAR TODAS LAS COLUMNAS
-        # ——————————————————————————————
+        # -------------------------------------------
+        # 2) Mapeo estándar
+        # -------------------------------------------
         col_map = {
             "Banco": "Banco",
-            "Tipo_Mov": "tipo_mov",
-            "Descripcion": "Descripcion",     # <-- AHORA ENVIAMOS EXACTO LO QUE EL MATCHER REQUIERE
+            "Descripcion": "Descripcion",
             "Monto": "Monto",
             "Moneda": "Moneda",
             "Operacion": "Operacion",
+            "Tipo_Mov": "tipo_mov",
             "Destinatario": "destinatario",
             "Tipo_Documento": "tipo_documento"
         }
@@ -117,16 +140,27 @@ class DataMapper:
 
         df_std["Fecha"] = df["Fecha"]
 
-        ok(f"Movimientos bancarios normalizados: {len(df_std)} registros.")
+        # -------------------------------------------
+        # 3) Conversión de moneda (opcional)
+        # -------------------------------------------
+        df_std["es_dolares"] = df_std["Moneda"].astype(str).str.upper().str.contains("USD")
 
-        return df_std[[
+        # -------------------------------------------
+        # 4) Reordenar columnas
+        # -------------------------------------------
+        df_std = df_std[[
             "Banco",
             "Fecha",
             "tipo_mov",
-            "Descripcion",   # 🔥 YA ES COMPATIBLE
+            "Descripcion",
             "Monto",
             "Moneda",
             "Operacion",
+            "es_dolares",
             "destinatario",
-            "tipo_documento"
+            "tipo_documento",
         ]]
+
+        ok(f"Movimientos bancarios normalizados: {len(df_std)} registros.")
+
+        return df_std

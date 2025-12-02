@@ -1,183 +1,287 @@
 # src/extractors/bank_extractor.py
+from __future__ import annotations
 
-import os
+# ============================================================
+#  EXTRACTOR DE BANCOS · PULSEFORGE · SQLITE (VERSIÓN PRO)
+# ============================================================
 import sys
+import sqlite3
+from pathlib import Path
+from typing import Dict, List, Optional
+
 import pandas as pd
-from sqlalchemy import text
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-from src.core.db import get_db
+# ------------------------------------------------------------
+#  BOOTSTRAP RUTAS
+# ------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+
+from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
-
-def info(msg):  print(f"🔵 {msg}")
-def ok(msg):    print(f"🟢 {msg}")
-def warn(msg):  print(f"🟡 {msg}")
-def error(msg): print(f"🔴 {msg}")
+from src.transformers.data_mapper import DataMapper
 
 
+# ============================================================
+#  CONEXIÓN SQLITE
+# ============================================================
+def _get_sqlite_connection() -> sqlite3.Connection:
+    db_type = str(get_env("PULSEFORGE_DB_TYPE", default="sqlite")).strip().lower()
+    if db_type != "sqlite":
+        error(f"PULSEFORGE_DB_TYPE='{db_type}' no soportado en BankExtractor.")
+        raise ValueError("Solo se soporta SQLite por ahora en BankExtractor.")
+
+    db_path = str(get_env("PULSEFORGE_DB_PATH")).strip()
+    if not db_path:
+        error("PULSEFORGE_DB_PATH no configurado en .env")
+        raise ValueError("Falta PULSEFORGE_DB_PATH en .env")
+
+    db_file = Path(db_path)
+    if not db_file.exists():
+        error(f"No existe la BD origen: {db_file}")
+        raise FileNotFoundError(db_file)
+
+    info(f"Conectando a BD origen SQLite → {db_file}")
+    return sqlite3.connect(db_file)
+
+
+# ============================================================
+#  EXTRACTOR DE BANCOS
+# ============================================================
 class BankExtractor:
 
-    def __init__(self):
-        info("Inicializando extractor bancario…")
+    def __init__(self) -> None:
+        info("Inicializando BankExtractor…")
+        self.mapper = DataMapper()
 
-        self.env = get_env()
-        self.db  = get_db()
+        tablas_cfg: Dict[str, str] = self.mapper.settings.get("tablas", {})
+        if not tablas_cfg:
+            error("No se encontraron 'tablas' en settings.json.")
+            raise KeyError("settings.tablas")
 
-        import json
-        cfg_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../config"))
+        # Filtrar solo las tablas de bancos (las que comienzan con 'banco_')
+        self._bank_tables: Dict[str, str] = {
+            key: value
+            for key, value in tablas_cfg.items()
+            if key.startswith("banco_")
+        }
 
-        settings_path  = os.path.join(cfg_dir, "settings.json")
-        constants_path = os.path.join(cfg_dir, "constants.json")
+        if not self._bank_tables:
+            warn("No se definieron tablas de bancos en settings.json (prefijo 'banco_').")
 
-        with open(settings_path, "r", encoding="utf-8") as f:
-            self.settings = json.load(f)
+        ok(f"BankExtractor listo. Tablas bancos detectadas: {list(self._bank_tables.keys())}")
 
-        if os.path.exists(constants_path):
-            with open(constants_path, "r", encoding="utf-8") as f:
-                self.constants = json.load(f)
-        else:
-            self.constants = {"considerar_montos_cero": False}
+        # Configuración de columnas de bancos desde settings.json
+        self._col_cfg: Dict[str, str] = self.mapper.settings.get("columnas_bancos", {})
 
-        self.col = self.settings["columnas_bancos"]
-
-        ok("Extractor bancario listo.")
-
-
+    # --------------------------------------------------------
+    #  Mapeo nombre lógico → código de banco
+    # --------------------------------------------------------
     @staticmethod
-    def _norm(s):
-        return str(s).lower().replace(" ", "").replace("_", "").replace("/", "").strip()
+    def _banco_code_from_key(key: str) -> str:
+        """
+        Convierte la clave de settings (banco_nacion, banco_bcp_soles, etc.)
+        en un código compacto que usará el matcher (BN, BCP, IBK, etc.).
+        """
+        k = key.lower()
 
+        if "nacion" in k:
+            return "BN"
+        if "bbva" in k:
+            return "BBVA"
+        if "bcp" in k:
+            return "BCP"
+        if "interbank" in k or "interb" in k or "ibk" in k:
+            return "IBK"
+        if "arequipa" in k:
+            return "AREQUIPA"
+        if "finanzas" in k:
+            return "FINANZAS"
 
-    def _find_col(self, df, configured_name):
-        if not configured_name:
-            return None
-        
-        target = self._norm(configured_name)
-        mapa = {self._norm(c): c for c in df.columns}
+        # Fallback genérico
+        return key.upper()
 
-        # exact
-        if target in mapa:
-            return mapa[target]
+    # --------------------------------------------------------
+    #  Helper para buscar columna "parecida" cuando la de settings
+    #  no existe en la tabla real (ej: n_operacion vs num_operacion)
+    # --------------------------------------------------------
+    @staticmethod
+    def _fallback_column(logical_key: str,
+                         hint: Optional[str],
+                         cols: List[str]) -> Optional[str]:
+        cols_lower = {c.lower(): c for c in cols}
 
-        # partial
-        for norm, real in mapa.items():
-            if target in norm or norm in target:
-                return real
+        # Si el hint viene y existe exacto (case-insensitive)
+        if hint:
+            h = hint.lower()
+            if h in cols_lower:
+                return cols_lower[h]
 
+        # Fallbacks específicos por tipo de campo
+        if logical_key == "operacion":
+            for cand in ["n_operacion", "num_operacion", "nro_operacion", "operacion", "referencia"]:
+                if cand in cols_lower:
+                    return cols_lower[cand]
+
+        if logical_key == "descripcion":
+            for cand in ["descripcion_actividad", "descripcion", "descripción", "glosa", "detalle", "concepto"]:
+                if cand in cols_lower:
+                    return cols_lower[cand]
+
+        if logical_key == "tipo_mov":
+            for cand in ["tipo_mov", "tipo_movimiento"]:
+                if cand in cols_lower:
+                    return cols_lower[cand]
+
+        if logical_key == "destinatario":
+            for cand in ["destinatario", "beneficiario", "cliente"]:
+                if cand in cols_lower:
+                    return cols_lower[cand]
+
+        if logical_key == "tipo_documento":
+            for cand in ["tipo_documento", "tdoc", "tipo_doc"]:
+                if cand in cols_lower:
+                    return cols_lower[cand]
+
+        if logical_key == "monto":
+            for cand in ["monto", "abono", "importe", "monto_total"]:
+                if cand in cols_lower:
+                    return cols_lower[cand]
+
+        if logical_key == "moneda":
+            for cand in ["moneda", "divisa"]:
+                if cand in cols_lower:
+                    return cols_lower[cand]
+
+        # Si no se encontró nada
         return None
 
+    # --------------------------------------------------------
+    #  Normalización de una tabla de banco específica
+    # --------------------------------------------------------
+    def _normalize_single_bank(self, df_raw: pd.DataFrame, banco_code: str) -> pd.DataFrame:
+        """
+        A partir del DataFrame crudo de UNA tabla de banco:
+          - Asigna código de banco en columna 'Banco'
+          - Crea columnas estándar esperadas por DataMapper.map_bancos:
+              Banco, Descripcion, Monto, Moneda,
+              Operacion, Tipo_Mov, Destinatario, Tipo_Documento
+          - Conserva 'fecha' y demás columnas crudas para que el mapper
+            pueda detectar la columna de fecha automáticamente.
+        """
 
-    # ============================================================
-    #  CARGA + NORMALIZACIÓN → DEVOLVER SOLO UNA COLUMNA "Fecha"
-    # ============================================================
-    def _load_table(self, table_name, alias, moneda_fija):
-        info(f"Cargando banco {alias} desde {table_name}")
+        df = df_raw.copy()
 
-        try:
-            df_raw = pd.read_sql(text(f"SELECT rowid, * FROM {table_name}"), self.db.engine_origen)
-        except Exception as e:
-            error(f"Error leyendo {table_name}: {e}")
-            return pd.DataFrame()
+        # Marcar banco
+        df["Banco"] = banco_code
 
-        if df_raw.empty:
-            warn(f"Tabla {table_name} vacía.")
-            return pd.DataFrame()
+        # Config settings columnas_bancos (puede venir vacío o parcial)
+        cfg = self._col_cfg or {}
 
-        # buscar columnas reales
-        fecha        = self._find_col(df_raw, self.col.get("fecha"))
-        tipo_mov     = self._find_col(df_raw, self.col.get("tipo_mov"))
-        descripcion  = self._find_col(df_raw, self.col.get("descripcion"))
-        monto        = self._find_col(df_raw, self.col.get("monto"))
-        operacion    = self._find_col(df_raw, self.col.get("operacion"))
-        destinatario = self._find_col(df_raw, self.col.get("destinatario"))
-        tipo_doc     = self._find_col(df_raw, self.col.get("tipo_documento"))
+        # Mapeo lógico → nombre interno que espera DataMapper.map_bancos
+        target_names = {
+            "descripcion": "Descripcion",
+            "monto": "Monto",
+            "moneda": "Moneda",
+            "operacion": "Operacion",
+            "tipo_mov": "Tipo_Mov",
+            "destinatario": "Destinatario",
+            "tipo_documento": "Tipo_Documento",
+        }
 
-        if not fecha or not monto:
-            warn(f"{table_name}: faltan columnas mínimas para el procesamiento.")
-            return pd.DataFrame()
+        for logical_key, target_col in target_names.items():
+            hint_col = cfg.get(logical_key)  # nombre de columna sugerido por settings.json
+            chosen_col = None
 
-        df = pd.DataFrame()
-        df["Banco"]        = alias
-        df["source_table"] = table_name
-        df["origen_rowid"] = df_raw["rowid"]
+            if hint_col and hint_col in df.columns:
+                chosen_col = hint_col
+            else:
+                chosen_col = self._fallback_column(logical_key, hint_col, list(df.columns))
 
-        # 🔥 NORMALIZACIÓN ÚNICA DE FECHA
-        df["Fecha"] = pd.to_datetime(df_raw[fecha], errors="coerce")
-
-        # tipo mov
-        df["Tipo_Mov"] = df_raw[tipo_mov].astype(str).str.upper().str.strip() if tipo_mov else ""
-
-        # descripción
-        df["Descripcion"] = df_raw[descripcion].astype(str).str.strip() if descripcion else ""
-
-        # monto limpio
-        monto_series = df_raw[monto].astype(str)
-        monto_series = (monto_series
-            .str.replace(" ", "")
-            .str.replace(",", ".", regex=False)
-        )
-        monto_series = monto_series.apply(
-            lambda x: x if x.count(".") <= 1 else x.replace(".", "", x.count(".") - 1)
-        )
-
-        df["Monto"] = pd.to_numeric(monto_series, errors="coerce").fillna(0)
-
-        df["Moneda"] = moneda_fija
-        df["Operacion"] = df_raw[operacion].astype(str).str.strip() if operacion else ""
-        df["Destinatario"] = df_raw[destinatario].astype(str).str.strip() if destinatario else ""
-        df["Tipo_Documento"] = df_raw[tipo_doc].astype(str).str.upper().str.strip() if tipo_doc else ""
-
-        # filtro de montos cero
-        if not self.constants.get("considerar_montos_cero", False):
-            df = df[df["Monto"] != 0]
-
-        ok(f"Movimientos validados: {len(df)}")
-        return df
-
-
-    # ============================================================
-    # MÉTODO FINAL PARA EL PIPELINE
-    # ============================================================
-    def get_todos_movimientos(self):
-        info("Unificando movimientos bancarios…")
-
-        t = self.settings["tablas"]
-
-        bancos_cfg = [
-            ("banco_nacion",          "BN",      "PEN"),
-            ("banco_bbva_soles",      "BBVA-S",  "PEN"),
-            ("banco_bcp_dolares",     "BCP-USD", "USD"),
-            ("banco_bcp_soles",       "BCP-S",   "PEN"),
-            ("banco_interbank_soles", "IBK-S",   "PEN"),
-            ("banco_arequipa_soles",  "ARE-S",   "PEN"),
-            ("banco_finanzas_soles",  "FIN-S",   "PEN"),
-        ]
-
-        dfs = []
-
-        for key, alias, moneda in bancos_cfg:
-            tbl = t.get(key)
-            if not tbl:
-                warn(f"{key} no está configurado en settings.json")
+            if not chosen_col:
+                warn(f"[BANCOS] No se encontró columna para '{logical_key}' en banco '{banco_code}'. "
+                     f"Columna '{target_col}' quedará vacía.")
+                df[target_col] = ""
                 continue
 
-            df = self._load_table(tbl, alias, moneda)
-            if not df.empty:
-                dfs.append(df)
+            # Copiar valor a la columna estándar
+            df[target_col] = df[chosen_col]
 
-        if not dfs:
-            warn("No se encontró ningún movimiento bancario.")
+        return df
+
+    # --------------------------------------------------------
+    #  LECTURA Y NORMALIZACIÓN GLOBAL DE TODOS LOS BANCOS
+    # --------------------------------------------------------
+    def get_bancos_mapeados(self) -> pd.DataFrame:
+        """
+        Lee todas las tablas de bancos configuradas, las normaliza
+        y luego aplica DataMapper.map_bancos() a cada una.
+        Devuelve un único DataFrame estándar para todo PulseForge.
+        """
+        if not self._bank_tables:
+            warn("No hay tablas de bancos configuradas. Retornando DF vacío.")
             return pd.DataFrame()
 
-        df_final = pd.concat(dfs, ignore_index=True)
+        conn = _get_sqlite_connection()
+        df_all: List[pd.DataFrame] = []
 
-        # 🔥 BORRAR CUALQUIER OTRA COLUMNA FECHA QUE SE HAYA PEGADO
-        for c in df_final.columns:
-            if c.lower() in ["fecha_mov", "fechaoriginal", "fecha_ope", "fecha_trans"]:
-                if c != "Fecha":
-                    df_final.drop(columns=[c], inplace=True)
+        try:
+            for key, table in self._bank_tables.items():
+                banco_code = self._banco_code_from_key(key)
+                info(f"Leyendo movimientos de banco '{banco_code}' desde tabla '{table}'…")
 
-        df_final = df_final.sort_values(by=["Fecha", "Banco", "Monto"])
+                try:
+                    df_raw = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
+                except Exception as e:
+                    error(f"Error leyendo tabla '{table}': {e}")
+                    continue
 
-        ok(f"Total movimientos unificados: {len(df_final)}")
+                if df_raw.empty:
+                    warn(f"Tabla '{table}' vacía. Se omite.")
+                    continue
+
+                ok(f"Movimientos crudos leídos de '{table}': {len(df_raw)} filas.")
+
+                # Normalizar crudo → columnas estándar internas
+                df_norm = self._normalize_single_bank(df_raw, banco_code)
+
+                # Pasar por DataMapper.map_bancos para esquema final
+                try:
+                    df_mapped = self.mapper.map_bancos(df_norm)
+                except Exception as e:
+                    error(f"Error en map_bancos para '{table}': {e}")
+                    continue
+
+                df_all.append(df_mapped)
+                ok(f"Movimientos normalizados para banco '{banco_code}': {len(df_mapped)} filas.")
+
+        finally:
+            conn.close()
+
+        if not df_all:
+            warn("No se generaron movimientos bancarios normalizados. Retornando DF vacío.")
+            return pd.DataFrame()
+
+        df_final = pd.concat(df_all, ignore_index=True)
+        ok(f"Total movimientos bancarios normalizados (todos los bancos): {len(df_final)} registros.")
+
         return df_final
+
+
+# ============================================================
+#  TEST LOCAL
+# ============================================================
+if __name__ == "__main__":
+    try:
+        be = BankExtractor()
+        df_bancos = be.get_bancos_mapeados()
+
+        print(df_bancos.head())
+        print("\nResumen por banco:")
+        if not df_bancos.empty:
+            print(df_bancos.groupby("Banco")["Monto"].count())
+
+        ok("Test rápido de BankExtractor completado.")
+    except Exception as e:
+        error(f"Fallo en test de BankExtractor: {e}")
