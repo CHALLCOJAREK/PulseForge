@@ -9,7 +9,13 @@ import shutil
 # ======================================================
 RUTA_BACKUP = r"C:\BACKUPS_JAREK\Backup-PulseForge"
 RUTA_ESTRUCTURA = r"C:\Proyectos\PulseForge\estructura.txt"
-CARPETAS_IGNORADAS = ["forge_env", "venv", ".venv", "env"]  # entornos virtuales
+
+# Carpetas cuyos CONTENIDOS NO deben mostrarse
+CARPETAS_IGNORADAS = ["forge_env", "venv", ".venv", "env"]
+
+# Carpetas especiales con profundidad limitada (solo nivel 1–2)
+CARPETAS_NIVEL_LIMITADO = [".git"]
+
 
 # ======================================================
 # Ejecutar comandos con control elegante
@@ -22,8 +28,9 @@ def run(cmd, msg_ok=None):
     if msg_ok:
         print(f"   ✔️  {msg_ok}")
 
+
 # ======================================================
-# Crear backup completo del proyecto
+# Crear backup completo con progreso REAL %
 # ======================================================
 def hacer_backup():
     origen = os.path.abspath(os.getcwd())
@@ -32,16 +39,54 @@ def hacer_backup():
     fecha = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     destino = os.path.join(RUTA_BACKUP, f"Backup_{fecha}")
 
-    try:
-        print("\n🗂️  Creando backup del proyecto…")
-        shutil.copytree(origen, destino)
-        print(f"   ✔️  Backup creado en:\n       {destino}")
-    except Exception as e:
-        print(f"❌  Error creando backup: {e}")
-        sys.exit(1)
+    print("\n🗂️  Creando backup del proyecto…\n")
+
+    # Contar archivos
+    total_archivos = 0
+    for ruta_actual, subdirs, files in os.walk(origen):
+        # Saltar carpetas ignoradas
+        if any(ign in ruta_actual for ign in CARPETAS_IGNORADAS):
+            continue
+        total_archivos += len(files)
+
+    if total_archivos == 0:
+        print("❌ No hay archivos para copiar.")
+        return
+
+    # Crear carpeta destino
+    os.makedirs(destino, exist_ok=True)
+
+    # Copiar con progreso
+    archivos_copiados = 0
+    for ruta_actual, subdirs, files in os.walk(origen):
+
+        if any(ign in ruta_actual for ign in CARPETAS_IGNORADAS):
+            continue
+
+        rel_path = os.path.relpath(ruta_actual, origen)
+        destino_carpeta = os.path.join(destino, rel_path)
+        os.makedirs(destino_carpeta, exist_ok=True)
+
+        for file in files:
+            origen_file = os.path.join(ruta_actual, file)
+            destino_file = os.path.join(destino_carpeta, file)
+
+            try:
+                shutil.copy2(origen_file, destino_file)
+                archivos_copiados += 1
+
+                porcentaje = (archivos_copiados / total_archivos) * 100
+                sys.stdout.write(f"\r📦 Copiando archivos… {porcentaje:6.2f}%")
+                sys.stdout.flush()
+
+            except Exception as e:
+                print(f"\n❌ Error copiando {origen_file}: {e}")
+
+    print(f"\n\n   ✔️  Backup creado en:\n       {destino}")
+
 
 # ======================================================
-# Crear estructura del proyecto en un archivo
+# Generar estructura del proyecto
 # ======================================================
 def escribir_estructura():
     print("\n📄  Generando estructura del proyecto…")
@@ -49,35 +94,45 @@ def escribir_estructura():
     root = os.path.abspath(os.getcwd())
     lines = ["📦 PulseForge\n"]
 
-    for carpeta_raiz, subdirs, archivos in os.walk(root):
-        # Transformar rutas a formato relativo
+    for carpeta_raiz, subdirs, files in os.walk(root):
         rel = os.path.relpath(carpeta_raiz, root)
 
-        # Saltar contenido de carpetas ignoradas
+        # Ignorar contenido de carpetas ignoradas
         if any(rel.split(os.sep)[0] == ign for ign in CARPETAS_IGNORADAS):
             continue
 
-        indent = " ┃ " * (rel.count(os.sep))
-        folder_name = os.path.basename(carpeta_raiz)
+        # Manejo especial .git → solo nivel 1 y 2
+        partes = rel.split(os.sep)
+        carpeta_top = partes[0]
 
-        # Mostrar carpetas ignoradas solo como nombre
-        if folder_name in CARPETAS_IGNORADAS:
-            lines.append(f"{indent}┗ 📂 {folder_name}  (contenido oculto)\n")
-            subdirs[:] = []  # evita que baje dentro
+        if carpeta_top in CARPETAS_NIVEL_LIMITADO:
+            nivel = len(partes)
+
+            if nivel == 1:  # Solo mostrar la carpeta
+                lines.append(f"📂 {carpeta_top}  (contenido limitado)\n")
+            elif nivel == 2:  # Mostrar nivel 2
+                indent = " ┃ "
+                lines.append(f"{indent}📂 {partes[1]}\n")
+
+            # No mostrar más niveles
             continue
 
         # Carpeta normal
         if rel != ".":
+            indent = " ┃ " * (rel.count(os.sep))
+            folder_name = os.path.basename(carpeta_raiz)
             lines.append(f"{indent}📂 {folder_name}\n")
 
         # Archivos
-        for archivo in archivos:
+        for archivo in files:
+            indent = " ┃ " * (rel.count(os.sep))
             lines.append(f"{indent} ┣ 📜 {archivo}\n")
 
     with open(RUTA_ESTRUCTURA, "w", encoding="utf-8") as f:
         f.writelines(lines)
 
     print(f"   ✔️  Estructura guardada en:\n       {RUTA_ESTRUCTURA}")
+
 
 # ======================================================
 # PROCESO PRINCIPAL
@@ -86,7 +141,7 @@ if __name__ == "__main__":
     mensaje = f"Auto-commit {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
     print("\n====================================================")
-    print(" 🔥  GIT PUSH + BACKUP + ESTRUCTURA – Fénix Engine v4 ")
+    print(" 🔥  GIT PUSH + BACKUP + ESTRUCTURA – Fénix Engine v5 ")
     print("====================================================\n")
 
     print("📌  Inicializando proceso...\n")
