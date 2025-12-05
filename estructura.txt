@@ -6,6 +6,7 @@
  ┣ 📜 gitpush.py
  ┣ 📜 README.md
  ┣ 📜 requirements.txt
+ ┣ 📜 run_pulseforge_setup.py
 📂 .git  (contenido limitado)
  ┃ 📂 hooks
  ┃ 📂 info
@@ -25,6 +26,7 @@
 📂 src
  ┣ 📜 cli.py
  ┣ 📜 main.py
+ ┣ 📜 test.py
  ┃ 📂 api
  ┃  ┣ 📜 api_server.py
  ┃ 📂 core
