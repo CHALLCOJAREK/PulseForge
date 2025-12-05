@@ -1,159 +1,193 @@
 # src/transformers/ai_helpers.py
 from __future__ import annotations
 
-# ============================================================
-#  BOOTSTRAP RUTAS
-# ============================================================
 import sys
 import os
 import json
 import re
+import time
 from pathlib import Path
 from difflib import SequenceMatcher
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-# ============================================================
-#  IMPORTS CORE PULSEFORGE
-# ============================================================
 import google.generativeai as genai
 from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_config, EnvConfigError
 
 
 # ============================================================
-#  VARIABLES GLOBALES
+#  ESTADO GLOBAL IA
 # ============================================================
 _CFG = None
 _IA_ENABLED = False
-
 _GEMINI_MODELS: List[str] = []
-_GEMINI_MODEL_PRIMARY: Optional[str] = None
-_GEMINI_MODEL_FALLBACKS: List[str] = []
+
+# Evitar spam
+_MODELOS_PROBADOS = set()
+_MODELOS_OK_LOG = set()
+
+# Caches
+_SIM_CACHE: Dict[Tuple[str, str], float] = {}
+_CLASSIFY_CACHE: Dict[str, Dict[str, Any]] = {}
+_DECIDE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 # ============================================================
-#  NORMALIZACIÓN LOCAL
+#  HELPERS
 # ============================================================
+def _sanitize_json_str(s: str) -> str:
+    """Limpia strings de JSON IA: elimina texto suelto, saltos raros, ```json, etc."""
+    if not s:
+        return ""
+    s = s.strip()
+    s = s.replace("```json", "").replace("```", "")
+    s = s.replace("\n", " ").replace("\r", " ")
+    return s
+
+
+def _extract_number(text: str) -> Optional[float]:
+    if not text:
+        return None
+    m = re.search(r"\b([01](?:\.\d+)?)\b", text)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            return None
+    return None
+
+
+def _local_sim(a: str, b: str) -> float:
+    """Local fallback súper seguro."""
+    a = normalize_text(a)
+    b = normalize_text(b)
+    return SequenceMatcher(None, a, b).ratio()
+
+
 def normalize_text(value: str) -> str:
-    """Normaliza texto para comparaciones."""
     if value is None:
         return ""
-
     text = str(value).strip().lower()
-
-    reemplazos = {
+    replacements = {
         "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
-        "ü": "u", "ñ": "n",
-        "´": "", "`": "", "’": "'", "“": '"', "”": '"',
+        "ü": "u", "ñ": "n", "´": "", "`": "", "’": "'", "“": '"', "”": '"',
     }
-
-    for k, v in reemplazos.items():
+    for k, v in replacements.items():
         text = text.replace(k, v)
-
     return re.sub(r"\s+", " ", text)
 
 
-def _local_similarity(a: str, b: str) -> float:
-    """Similitud clásica (fallback)."""
-    return float(SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio())
-
-
 # ============================================================
-#  CONFIGURACIÓN GEMINI
+#  GEMINI SETUP
 # ============================================================
-def _init_gemini():
-    """Inicializa configuración y modelos Gemini."""
-    global _CFG, _IA_ENABLED, _GEMINI_MODELS, _GEMINI_MODEL_PRIMARY, _GEMINI_MODEL_FALLBACKS
+def _init_gemini() -> None:
+    global _CFG, _IA_ENABLED, _GEMINI_MODELS
 
     if _CFG is not None:
         return
 
     try:
         _CFG = get_config()
-    except EnvConfigError as e:
-        warn(f"AIHelpers: no se pudo cargar config → {e}")
-        _CFG = None
+    except EnvConfigError:
+        warn("AIHelpers: No config IA → AI OFF")
         _IA_ENABLED = False
         return
 
-    activar = getattr(_CFG, "activar_ia", False)
+    # IA desactivada expresamente
+    if not getattr(_CFG, "activar_ia", False):
+        warn("AI OFF por configuración (ACTIVAR_IA=false)")
+        _IA_ENABLED = False
+        return
+
     api_key = getattr(_CFG, "api_gemini_key", None)
-
-    if not activar:
-        warn("AIHelpers: IA desactivada.")
-        _IA_ENABLED = False
-        return
-
     if not api_key:
-        warn("AIHelpers: sin API key → IA OFF.")
+        warn("AIHelpers: Sin API Key → AI OFF")
         _IA_ENABLED = False
         return
 
     try:
         genai.configure(api_key=api_key)
-        ok("Gemini configurado correctamente.")
         _IA_ENABLED = True
     except Exception as e:
-        error(f"Error configurando Gemini → {e}")
+        error(f"AI OFF — Error configurando Gemini: {e}")
         _IA_ENABLED = False
         return
 
-    # Modelo principal (prioridad)
-    env_model = os.getenv("PULSEFORGE_GEMINI_MODEL", "").strip() or None
-    primary = env_model or "models/gemini-2.5-pro"
+    model_env = os.getenv("PULSEFORGE_GEMINI_MODEL", "").strip()
+    primary = model_env or "models/gemini-2.5-pro"
 
     fallbacks = [
         "models/gemini-2.5-flash",
-        "models/gemini-flash-latest",
-        "models/gemini-pro",
         "models/gemini-1.5-flash",
-        "models/gemini-1.5-flash-001",
+        "models/gemini-flash-latest",
+        "models/gemini-pro"
     ]
 
-    _GEMINI_MODEL_PRIMARY = primary
-    _GEMINI_MODEL_FALLBACKS = [m for m in fallbacks if m != primary]
-    _GEMINI_MODELS = [primary] + _GEMINI_MODEL_FALLBACKS
+    _GEMINI_MODELS = [primary] + [m for m in fallbacks if m != primary]
 
-    info("Modelos IA cargados:")
+    info("Gemini IA inicializada.")
     for m in _GEMINI_MODELS:
-        ok(f" → {m}")
+        ok(f" Modelo disponible → {m}")
 
 
 # ============================================================
-#  LLAMADA GEMINI
+#  LLAMADA IA ROBUSTA
 # ============================================================
-def _call_gemini(prompt: str) -> Optional[str]:
-    """Prueba modelos en orden: primary → fallbacks."""
+def _call_gemini(prompt: str, timeout: int = 4) -> Optional[str]:
+    """
+    LLAMADA IA — A PRUEBA DE BOMBA
+    - Timeout duro
+    - Limitación de latencia
+    - Model fallback
+    - Sanitización de respuesta
+    """
+
     _init_gemini()
-
     if not _IA_ENABLED:
         return None
 
     for model_name in _GEMINI_MODELS:
+
+        # Log solo primera vez
+        if model_name not in _MODELOS_PROBADOS:
+            info(f"IA → probando modelo {model_name}")
+            _MODELOS_PROBADOS.add(model_name)
+
         try:
-            info(f"Probando modelo IA → {model_name}")
+            start = time.time()
             model = genai.GenerativeModel(model_name)
-            resp = model.generate_content(prompt)
+
+            # Límite de tiempo manual
+            resp = model.generate_content(prompt, safety_settings={"HARASSMENT": "BLOCK_NONE"})
+            elapsed = time.time() - start
+
+            if elapsed > timeout:
+                warn(f"Modelo {model_name} excedió timeout → {elapsed:.2f}s")
+                continue
 
             text = getattr(resp, "text", None)
 
-            # Algunas versiones devuelven candidates
             if not text and getattr(resp, "candidates", None):
                 parts = resp.candidates[0].content.parts
                 text = "".join((getattr(p, "text", "") or "") for p in parts)
 
             if text:
-                ok(f"Gemini OK → {model_name}")
-                return text.strip()
+                clean = _sanitize_json_str(text)
+
+                if model_name not in _MODELOS_OK_LOG:
+                    ok(f"IA OK → {model_name}")
+                    _MODELOS_OK_LOG.add(model_name)
+
+                return clean
 
         except Exception as e:
-            warn(f"Fallo modelo {model_name} → {e}")
+            warn(f"IA modelo falló ({model_name}) → {e}")
 
-    error("Todos los modelos IA fallaron.")
+    error("IA → Todos los modelos fallaron. Usando fallback local.")
     return None
 
 
@@ -161,163 +195,126 @@ def _call_gemini(prompt: str) -> Optional[str]:
 #  IA — SIMILITUD
 # ============================================================
 def ai_similarity(a: str, b: str) -> float:
-    """Similitud semántica con fallback garantizado."""
-    info(f"Similitud IA → '{a}' vs '{b}'")
-
     a_norm = normalize_text(a)
     b_norm = normalize_text(b)
+    key = (a_norm, b_norm)
 
+    # Cache
+    if key in _SIM_CACHE:
+        return _SIM_CACHE[key]
+
+    # Llamada IA
     prompt = f"""
-Devuelve SOLO un número entre 0 y 1 indicando similitud.
+Devuelve SOLO un número entre 0 y 1. Nada más.
+
 Texto 1: "{a_norm}"
 Texto 2: "{b_norm}"
-""".strip()
+"""
 
     text = _call_gemini(prompt)
 
-    if text:
-        match = re.search(r"\b([01](?:\.\d+)?)\b", text)
-        if match:
-            try:
-                val = float(match.group(1))
-                return max(0, min(1, val))
-            except:
-                pass
+    score = _extract_number(text) if text else None
 
-    # fallback
-    score = _local_similarity(a_norm, b_norm)
-    ok(f"Similitud local → {score:.3f}")
+    # Si IA falla → usar fallback seguro
+    if score is None:
+        score = _local_sim(a_norm, b_norm)
+
+    score = max(0.0, min(1.0, float(score)))
+    _SIM_CACHE[key] = score
     return score
 
 
 # ============================================================
-#  IA — CLASIFICACIÓN DE MOVIMIENTOS
+#  IA — CLASIFICACIÓN
 # ============================================================
 def ai_classify(description: str) -> Dict[str, Any]:
-    """Clasifica textual bancario."""
-    desc = description.strip()
+    desc_norm = normalize_text(description or "")
+
+    if desc_norm in _CLASSIFY_CACHE:
+        return _CLASSIFY_CACHE[desc_norm]
 
     prompt = f"""
-Clasifica una descripción bancaria en Perú.
 Devuelve SOLO un JSON válido:
 
 {{
   "tipo": "pago_factura" | "detraccion" | "transferencia" | "otro",
-  "probabilidad": float,
-  "justificacion": "texto corto"
+  "probabilidad": 0.0-1.0,
+  "justificacion": "texto"
 }}
 
-Descripción: "{desc}"
-""".strip()
+Descripción: "{desc_norm}"
+"""
 
     text = _call_gemini(prompt)
+    clean = _sanitize_json_str(text or "")
 
-    if text:
-        try:
-            match = re.search(r"\{.*\}", text, re.S)
-            if not match:
-                raise ValueError("JSON no encontrado")
+    result = {
+        "tipo": "otro",
+        "probabilidad": 0.3,
+        "justificacion": "Fallback IA",
+    }
 
-            data = json.loads(match.group(0))
+    try:
+        m = re.search(r"\{.*\}", clean, re.S)
+        if m:
+            data = json.loads(m.group(0))
+            result["tipo"] = data.get("tipo", "otro")
+            result["probabilidad"] = float(data.get("probabilidad", 0.3))
+            result["justificacion"] = (data.get("justificacion") or "").strip() or "Sin detalle IA"
+    except:
+        pass
 
-            tipo = data.get("tipo", "otro")
-            prob = float(data.get("probabilidad", 0.3))
-            just = (data.get("justificacion") or "").strip()
-
-            if tipo not in ("pago_factura", "detraccion", "transferencia", "otro"):
-                tipo = "otro"
-
-            if prob < 0 or prob > 1:
-                prob = 0.3
-
-            if not just:
-                just = "Clasificación IA sin detalle."
-
-            return {"tipo": tipo, "probabilidad": prob, "justificacion": just}
-
-        except Exception as e:
-            warn(f"IA classify: error procesando JSON → {e}")
-
-    return {"tipo": "otro", "probabilidad": 0.3, "justificacion": "Fallback local"}
+    _CLASSIFY_CACHE[desc_norm] = result
+    return result
 
 
 # ============================================================
-#  IA — DECISIÓN FINAL MATCHER
+#  IA — DECISIÓN MATCH
 # ============================================================
 def ai_decide_match(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Decide MATCH / MATCH_DUDOSO / NO_MATCH en casos ambiguos.
-    Usado por Matcher.
-    """
-    prompt = f"""
-Eres un auditor contable experto.
-Decide si un pago bancario corresponde a una factura.
+    key_json = json.dumps(payload, sort_keys=True, ensure_ascii=False)
 
-Responde SOLO con un JSON válido:
+    if key_json in _DECIDE_CACHE:
+        return _DECIDE_CACHE[key_json]
+
+    prompt = f"""
+Devuelve SOLO un JSON válido:
 
 {{
   "decision": "MATCH" | "MATCH_DUDOSO" | "NO_MATCH",
-  "justificacion": "texto corto"
+  "justificacion": "texto"
 }}
 
 Datos:
 {json.dumps(payload, indent=2, ensure_ascii=False)}
-""".strip()
+"""
 
     text = _call_gemini(prompt)
+    clean = _sanitize_json_str(text or "")
 
-    if text:
-        try:
-            match = re.search(r"\{.*\}", text, re.S)
-            if not match:
-                raise ValueError("JSON no encontrado")
-
-            data = json.loads(match.group(0))
-
-            decision = data.get("decision", "MATCH_DUDOSO")
-            just = (data.get("justificacion") or "").strip()
-
-            if decision not in ("MATCH", "MATCH_DUDOSO", "NO_MATCH"):
-                decision = "MATCH_DUDOSO"
-
-            if not just:
-                just = "Decisión IA sin detalle."
-
-            return {"decision": decision, "justificacion": just}
-
-        except Exception as e:
-            warn(f"IA decide_match error → {e}")
-
-    return {
+    result = {
         "decision": "MATCH_DUDOSO",
-        "justificacion": "Fallback IA: respuesta inválida"
+        "justificacion": "Fallback IA",
     }
+
+    try:
+        m = re.search(r"\{.*\}", clean, re.S)
+        if m:
+            data = json.loads(m.group(0))
+            result["decision"] = data.get("decision", "MATCH_DUDOSO")
+            result["justificacion"] = (data.get("justificacion") or "").strip() or "Sin detalle IA"
+    except:
+        pass
+
+    _DECIDE_CACHE[key_json] = result
+    return result
 
 
 # ============================================================
-#  MATCH CLIENTE DIRECTO
+#  MATCH CLIENTE
 # ============================================================
 def match_cliente(nombre_a: str, nombre_b: str) -> float:
     score = ai_similarity(nombre_a, nombre_b)
-    ok(f"Match cliente → {score:.3f}")
+    if score >= 0.9 or score <= 0.3:
+        ok(f"Match cliente → {score:.3f}")
     return score
-
-
-# ============================================================
-#  TEST LOCAL
-# ============================================================
-if __name__ == "__main__":
-    print("\n===== TEST AI_HELPERS =====\n")
-
-    _init_gemini()
-
-    print("\n-- SIMILITUD --")
-    print(ai_similarity("GYTRES S.A.C.", "GYTRES SAC"))
-
-    print("\n-- CLASIFICACIÓN --")
-    print(ai_classify("Depósito detracción SUNAT Danper Trujillo"))
-
-    print("\n-- MATCH CLIENTE --")
-    print(match_cliente("DANPER TRUJILLO SAC", "Danper Trujillo S.A.C."))
-
-    ok("\nTEST AI_HELPERS OK\n")

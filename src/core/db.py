@@ -1,229 +1,164 @@
 # src/core/db.py
 from __future__ import annotations
-
-# --- BOOTSTRAP PARA RUTAS ---
 import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
-# -----------------------------
 
 import sqlite3
-from typing import Optional, List, Dict, Any
 
-# Config
+from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_config
 
-# -----------------------------
-# LOGGING UNIFICADO
-# -----------------------------
-def info(msg): print(f"🔵 {msg}")
-def ok(msg): print(f"🟢 {msg}")
-def warn(msg): print(f"🟡 {msg}")
-def error(msg): print(f"🔴 {msg}")
 
-
-# ================================================================
-#     MOTOR DE BASE DE DATOS UNIFICADO – PULSEFORGE DB ENGINE
-# ================================================================
+# ============================================================
+#   EXCEPCIÓN CENTRAL DE BD
+# ============================================================
 class DatabaseError(Exception):
     pass
 
 
-class PulseForgeDB:
-    def __init__(self):
-        self.cfg = get_config()
+# ============================================================
+#   BASE CLASS — MOTOR NEUTRO
+# ============================================================
+class BaseDB:
+    """Clase base compartida para cualquier motor de BD."""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
         self.connection = None
 
-    # ------------------------------------------------------------
-    #   CONECTOR PRINCIPAL
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
     def connect(self):
-        db_type = self.cfg.db_type
+        """Conexión segura a SQLite."""
+        try:
+            info(f"Conectando a SQLite → {self.db_path}")
+            self.connection = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                isolation_level=None  # modo autocommit estable
+            )
+            ok("Conexión exitosa.")
+            return self.connection
+        except Exception as e:
+            error(f"Error al conectar DB: {e}")
+            raise DatabaseError(e)
 
-        info(f"Conectando a la base de datos ({db_type})…")
+    # --------------------------------------------------------
+    def close(self):
+        """Cierra la conexión limpia."""
+        if self.connection:
+            try:
+                self.connection.close()
+                ok("Conexión cerrada correctamente.")
+            except Exception:
+                pass
+
+    # --------------------------------------------------------
+    def execute(self, query: str, params: Optional[tuple] = None):
+        """Ejecuta INSERT/UPDATE/DELETE con control de errores."""
+        if self.connection is None:
+            self.connect()
+
+        cur = self.connection.cursor()
+        try:
+            if params:
+                cur.execute(query, params)
+            else:
+                cur.execute(query)
+            return cur
+        except Exception as e:
+            error(f"Error en execute(): {e}\nQuery: {query}")
+            raise DatabaseError(e)
+
+    # --------------------------------------------------------
+    def read_query(self, query: str):
+        """Ejecuta SELECT usando pandas."""
+        import pandas as pd
+        if self.connection is None:
+            self.connect()
 
         try:
-            if db_type == "sqlite":
-                self.connection = sqlite3.connect(self.cfg.db_path)
-                ok(f"Conectado a SQLite: {self.cfg.db_path}")
-
-            elif db_type == "postgres":
-                import psycopg2
-                self.connection = psycopg2.connect(self.cfg.db_path)
-                ok("Conectado a PostgreSQL")
-
-            elif db_type == "mysql":
-                import mysql.connector
-                self.connection = mysql.connector.connect(self.cfg.db_path)
-                ok("Conectado a MySQL")
-
-            else:
-                raise DatabaseError(f"Tipo de DB no soportado: {db_type}")
-
+            df = pd.read_sql_query(query, self.connection)
+            ok(f"Consulta realizada: {len(df)} filas.")
+            return df
         except Exception as e:
-            error(f"Error conectando a la DB: {e}")
-            raise DatabaseError(str(e))
+            error(f"Error en read_query(): {e}")
+            raise DatabaseError(e)
 
-    # ------------------------------------------------------------
-    #   LEER TABLAS
-    # ------------------------------------------------------------
+    # --------------------------------------------------------
+    def fetch_all(self, table: str) -> List[Dict[str, Any]]:
+        """SELECT * FROM ... parseado a dict."""
+        if self.connection is None:
+            self.connect()
+
+        try:
+            cur = self.connection.cursor()
+            cur.execute(f"SELECT * FROM {table}")
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in rows]
+        except Exception as e:
+            error(f"Error leyendo tabla {table}: {e}")
+            raise DatabaseError(e)
+
+    # --------------------------------------------------------
     def get_tables(self) -> List[str]:
         if self.connection is None:
             self.connect()
 
-        info("Listando tablas de la base de datos…")
-
-        cursor = self.connection.cursor()
-
         try:
-            if self.cfg.db_type == "sqlite":
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                tables = [row[0] for row in cursor.fetchall()]
-
-            elif self.cfg.db_type == "postgres":
-                cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
-                tables = [row[0] for row in cursor.fetchall()]
-
-            elif self.cfg.db_type == "mysql":
-                cursor.execute("SHOW TABLES")
-                tables = [row[0] for row in cursor.fetchall()]
-
-            ok(f"Tablas encontradas: {tables}")
+            cur = self.connection.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cur.fetchall()]
+            ok(f"Tablas: {tables}")
             return tables
-
         except Exception as e:
-            error(f"Error listando tablas: {e}")
-            raise DatabaseError(str(e))
-
-    # ------------------------------------------------------------
-    #   LEER COLUMNAS DE UNA TABLA
-    # ------------------------------------------------------------
-    def get_columns(self, table: str) -> List[str]:
-        if self.connection is None:
-            self.connect()
-
-        info(f"Obteniendo columnas de: {table}")
-
-        cursor = self.connection.cursor()
-
-        try:
-            if self.cfg.db_type == "sqlite":
-                cursor.execute(f"PRAGMA table_info({table})")
-                columns = [row[1] for row in cursor.fetchall()]
-
-            elif self.cfg.db_type == "postgres":
-                cursor.execute(
-                    f"""
-                    SELECT column_name
-                    FROM information_schema.columns
-                    WHERE table_name = '{table}'
-                    """
-                )
-                columns = [row[0] for row in cursor.fetchall()]
-
-            elif self.cfg.db_type == "mysql":
-                cursor.execute(f"DESCRIBE {table}")
-                columns = [row[0] for row in cursor.fetchall()]
-
-            ok(f"Columnas obtenidas correctamente.")
-            return columns
-
-        except Exception as e:
-            error(f"Error listando columnas de {table}: {e}")
-            raise DatabaseError(str(e))
-
-    # ------------------------------------------------------------
-    #   LEER TODA UNA TABLA COMO DICTS
-    # ------------------------------------------------------------
-    def fetch_all(self, table: str) -> List[Dict[str, Any]]:
-        if self.connection is None:
-            self.connect()
-
-        info(f"Leyendo registros de la tabla: {table}")
-        cursor = self.connection.cursor()
-
-        try:
-            cursor.execute(f"SELECT * FROM {table}")
-            rows = cursor.fetchall()
-
-            col_names = [desc[0] for desc in cursor.description]
-            data = [dict(zip(col_names, r)) for r in rows]
-
-            ok(f"Registros obtenidos: {len(data)}")
-            return data
-
-        except Exception as e:
-            error(f"Error leyendo tabla {table}: {e}")
-            raise DatabaseError(str(e))
+            error(f"No se pudieron listar tablas: {e}")
+            raise DatabaseError(e)
 
 
-# =============================================================
-#  TEST DIRECTO DEL MÓDULO — VISUAL ENTERPRISE PRO
-# =============================================================
-if __name__ == "__main__":
-    print("\n" + "="*63)
-    print("🔵  PULSEFORGE · DB ENGINE TEST")
-    print("="*63 + "\n")
+# ============================================================
+#   BD ORIGEN → DATAPULSE
+# ============================================================
+class SourceDB(BaseDB):
+    """Lee la base DataPulse (origen)."""
 
-    try:
-        # ----------------------------------------------------
-        # CONFIGURACIÓN
-        # ----------------------------------------------------
+    def __init__(self):
         cfg = get_config()
-        ok("Configuración cargada correctamente.\n")
+        super().__init__(cfg.db_source_path)
+        info(f"BD Origen: {cfg.db_source_path}")
 
-        print("📂 CONFIGURACIÓN")
-        print("-" * 63)
-        print(f"  • Tipo de DB        : {cfg.db_type}")
-        print(f"  • Base origen       : {cfg.db_path}")
-        print(f"  • IGV               : {cfg.igv}")
-        print(f"  • Detracción        : {cfg.detraccion_porcentaje}")
-        print(f"  • TC USD → PEN      : {cfg.tipo_cambio_usd_pen}\n")
 
-        # ----------------------------------------------------
-        # CONEXIÓN
-        # ----------------------------------------------------
-        print("🗄️  CONEXIÓN")
-        print("-" * 63)
-        db = PulseForgeDB()
-        db.connect()
-        ok("Conexión establecida.\n")
+# ============================================================
+#   BD DESTINO → PULSEFORGE
+# ============================================================
+class PulseForgeDB(BaseDB):
+    """Escribe y lee la base interna PulseForge."""
 
-        # ----------------------------------------------------
-        # TABLAS
-        # ----------------------------------------------------
-        tables = db.get_tables()
-        print(f"📊 TABLAS ({len(tables)} encontradas)")
-        print("-" * 63)
-        for t in tables:
-            print(f"  - {t}")
-        print()
+    def __init__(self):
+        cfg = get_config()
+        super().__init__(cfg.db_path)
+        info(f"BD PulseForge: {cfg.db_path}")
 
-        # ----------------------------------------------------
-        # COLUMNAS POR TABLA
-        # ----------------------------------------------------
-        print("📑 ESTRUCTURA DE COLUMNAS")
-        print("-" * 63)
+    # Método extra para escritura masiva segura
+    def insert(self, table: str, data: Dict[str, Any]):
+        if not data:
+            warn("Insert vacío, se omite.")
+            return
 
-        for t in tables:
-            cols = db.get_columns(t)
+        columns = ", ".join(data.keys())
+        placeholders = ", ".join(["?"] * len(data))
+        values = tuple(data.values())
 
-            print(f"\n📁 {t}  ({len(cols)} columnas)")
-            print("    ----------------------------------------")
+        query = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+        self.execute(query, values)
 
-            for c in cols:
-                print(f"    - {c}")
-
-            print("    ----------------------------------------")
-
-        print("\n" + "="*63)
-        print("🟢  PRUEBA TERMINADA — SIN ERRORES")
-        print("="*63 + "\n")
-
-    except Exception as e:
-        print("\n" + "="*63)
-        error("ERROR CRÍTICO EN LA PRUEBA")
-        error(str(e))
-        print("="*63 + "\n")
+    def update(self, table: str, data: Dict[str, Any], where: str, params: tuple):
+        sets = ", ".join([f"{k}=?" for k in data.keys()])
+        values = tuple(data.values())
+        query = f"UPDATE {table} SET {sets} WHERE {where}"
+        self.execute(query, values + params)

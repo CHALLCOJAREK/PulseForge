@@ -154,6 +154,16 @@ class ClientsWriter:
         finally:
             conn.close()
 
+    # --------------------------------------------------------
+    # 🚀 NUEVO: alias estándar requerido por main.py
+    # --------------------------------------------------------
+    def save(self, df: pd.DataFrame, reset=False) -> int:
+        """
+        Alias universal para mantener compatibilidad con PulseForge:
+        main.py llama → ClientsWriter().save(df)
+        """
+        return self.save_clientes(df, reset=reset)
+
 
 # ============================================================
 #  TEST LOCAL

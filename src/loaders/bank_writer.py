@@ -2,15 +2,13 @@
 from __future__ import annotations
 
 # ============================================================
-#  PULSEFORGE · BANK WRITER
-#  Inserta movimientos bancarios en movimientos_pf
+#  PULSEFORGE · BANK WRITER (COMPATIBLE CON list[dict])
 # ============================================================
 import sys
 import sqlite3
 import hashlib
 from pathlib import Path
-
-import pandas as pd
+from typing import List, Dict
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -21,37 +19,37 @@ from src.core.env_loader import get_env
 
 
 # ------------------------------------------------------------
+#  HELPERS
+# ------------------------------------------------------------
 def _get_newdb_path() -> Path:
-    db_path = str(get_env("PULSEFORGE_NEWDB_PATH")).strip()
+    db_path = str(get_env("PULSEFORGE_NEWDB_PATH", default="")).strip()
     if not db_path:
-        error("PULSEFORGE_NEWDB_PATH no configurado en .env")
+        error("PULSEFORGE_NEWDB_PATH no configurado")
         raise ValueError("Falta PULSEFORGE_NEWDB_PATH")
 
-    db_file = Path(db_path)
-    db_file.parent.mkdir(parents=True, exist_ok=True)
-    return db_file
+    file = Path(db_path)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    return file
 
 
 def _get_connection() -> sqlite3.Connection:
-    db_file = _get_newdb_path()
-    if not db_file.exists():
-        warn(f"La BD destino aún no existe: {db_file}. Ejecuta newdb_builder.py.")
-    info(f"Conectando a BD PulseForge → {db_file}")
-    return sqlite3.connect(db_file)
+    db = _get_newdb_path()
+    if not db.exists():
+        warn(f"⚠ BD destino no existe aún → {db}")
+    return sqlite3.connect(db)
 
 
-def _compute_hash(row: pd.Series) -> str:
-    base = f"{row.get('Banco','')}|{row.get('Operacion','')}|{row.get('Fecha','')}"
+def _hash_mov(m: dict) -> str:
+    base = f"{m.get('Banco','')}|{m.get('Operacion','')}|{m.get('Fecha','')}"
     return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
 
 
 # ============================================================
+#  BANK WRITER (NUEVA ARQUITECTURA)
+# ============================================================
 class BankWriter:
-    """
-    Inserta movimientos bancarios ya mapeados en movimientos_pf.
-    """
 
-    EXPECTED_COLS = [
+    REQUIRED_FIELDS = [
         "Banco",
         "Fecha",
         "Descripcion",
@@ -63,164 +61,111 @@ class BankWriter:
         "Tipo_Documento",
     ]
 
-    def __init__(self) -> None:
+    def __init__(self):
         info("Inicializando BankWriter…")
         self.db_path = _get_newdb_path()
-        ok(f"BankWriter listo. BD destino: {self.db_path}")
+        ok(f"BD destino: {self.db_path}")
 
     # --------------------------------------------------------
-    def _ensure_table_exists(self, conn: sqlite3.Connection) -> None:
+    def _ensure_table(self, conn):
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT name FROM sqlite_master 
+        cur.execute("""
+            SELECT name FROM sqlite_master
             WHERE type='table' AND name='movimientos_pf'
-            """
-        )
+        """)
         if not cur.fetchone():
-            error("movimientos_pf no existe. Ejecuta newdb_builder.py primero.")
-            raise RuntimeError("Tabla movimientos_pf no encontrada.")
+            error("Tabla movimientos_pf NO existe. Ejecuta newdb_builder.py")
+            raise RuntimeError("movimientos_pf no encontrada.")
 
     # --------------------------------------------------------
-    def _normalize_df(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _normalize_record(self, mov: dict) -> dict:
         """
-        - Asegura columnas esperadas.
-        - Convierte tipos a algo que SQLite soporte (str, float, int).
+        Recibe un diccionario y asegura que esté completo y limpio.
         """
-        if df is None or df.empty:
-            warn("DF bancario vacío. Nada que insertar.")
-            return pd.DataFrame(columns=self.EXPECTED_COLS + ["source_hash"])
-
-        df2 = df.copy()
+        rec = mov.copy()
 
         # Asegurar columnas
-        for col in self.EXPECTED_COLS:
-            if col not in df2.columns:
-                warn(f"[BANK_WRITER] Columna faltante '{col}'. Se crea vacía.")
-                df2[col] = None
+        for col in self.REQUIRED_FIELDS:
+            if col not in rec:
+                warn(f"[BANK] Falta '{col}' → None")
+                rec[col] = None
 
-        # ---- Tipos seguros para SQLite ----
+        # Normalizar monto
+        try:
+            rec["Monto"] = float(rec.get("Monto", 0) or 0)
+        except:
+            rec["Monto"] = 0
 
-        # Fecha → string
-        if "Fecha" in df2.columns:
-            if pd.api.types.is_datetime64_any_dtype(df2["Fecha"]):
-                df2["Fecha"] = df2["Fecha"].dt.strftime("%Y-%m-%d")
-            else:
-                df2["Fecha"] = df2["Fecha"].astype(str)
+        # Normalizar fechas a string
+        rec["Fecha"] = str(rec.get("Fecha") or "")
 
-        # Monto → numérico
-        if "Monto" in df2.columns:
-            df2["Monto"] = pd.to_numeric(df2["Monto"], errors="coerce")
-
-        # Campos de texto → str
-        for col_text in [
-            "Banco",
-            "Descripcion",
-            "Moneda",
-            "Operacion",
-            "Tipo_Mov",
-            "Destinatario",
-            "Tipo_Documento",
+        # Convertir todo texto a str
+        for t in [
+            "Banco", "Descripcion", "Moneda", "Operacion",
+            "Tipo_Mov", "Destinatario", "Tipo_Documento"
         ]:
-            if col_text in df2.columns:
-                df2[col_text] = df2[col_text].astype(str)
+            v = rec.get(t)
+            rec[t] = str(v) if v not in (None, "") else ""
 
-        # Generar hash
-        df2["source_hash"] = df2.apply(_compute_hash, axis=1)
+        # Hash trazabilidad
+        rec["source_hash"] = _hash_mov(rec)
 
-        return df2
+        return rec
 
     # --------------------------------------------------------
-    def save_bancos(self, df_bancos: pd.DataFrame, reset: bool = False) -> int:
+    def save_bancos(self, movimientos: List[Dict], reset=False) -> int:
         """
-        Inserta movimientos bancarios en movimientos_pf.
+        Inserta movimientos bancarios (list[dict]) en movimientos_pf.
         """
-        df_norm = self._normalize_df(df_bancos)
-        if df_norm.empty:
-            warn("DF bancario normalizado vacío. No se insertará nada.")
+        if not movimientos:
+            warn("Lista de movimientos vacía.")
             return 0
 
+        registros = [self._normalize_record(m) for m in movimientos]
+
         conn = _get_connection()
-        try:
-            self._ensure_table_exists(conn)
+        self._ensure_table(conn)
+        cur = conn.cursor()
 
-            cur = conn.cursor()
+        if reset:
+            warn("Reset=True → limpiando movimientos_pf…")
+            cur.execute("DELETE FROM movimientos_pf")
 
-            if reset:
-                warn("Reset=True → limpiando movimientos_pf")
-                cur.execute("DELETE FROM movimientos_pf")
+        info("Insertando movimientos bancarios…")
 
-            info("Insertando movimientos bancarios en movimientos_pf…")
-
-            rows = df_norm.to_dict(orient="records")
-
-            cur.executemany(
-                """
-                INSERT INTO movimientos_pf (
-                    banco,
-                    fecha,
-                    descripcion,
-                    monto,
-                    moneda,
-                    operacion,
-                    tipo_mov,
-                    destinatario,
-                    tipo_documento,
-                    source_hash
-                ) VALUES (
-                    :Banco,
-                    :Fecha,
-                    :Descripcion,
-                    :Monto,
-                    :Moneda,
-                    :Operacion,
-                    :Tipo_Mov,
-                    :Destinatario,
-                    :Tipo_Documento,
-                    :source_hash
-                )
-                """,
-                rows,
+        cur.executemany("""
+            INSERT INTO movimientos_pf (
+                banco,
+                fecha,
+                descripcion,
+                monto,
+                moneda,
+                operacion,
+                tipo_mov,
+                destinatario,
+                tipo_documento,
+                source_hash
             )
+            VALUES (
+                :Banco,
+                :Fecha,
+                :Descripcion,
+                :Monto,
+                :Moneda,
+                :Operacion,
+                :Tipo_Mov,
+                :Destinatario,
+                :Tipo_Documento,
+                :source_hash
+            )
+        """, registros)
 
-            conn.commit()
-            inserted = len(rows)
-            ok(f"Movimientos insertados en movimientos_pf: {inserted}")
-            return inserted
+        conn.commit()
+        inserted = len(registros)
+        ok(f"Movimientos insertados: {inserted}")
+        conn.close()
+        return inserted
 
-        except Exception as e:
-            error(f"Error insertando movimientos bancarios: {e}")
-            raise
-
-        finally:
-            conn.close()
-
-    # --------------------------------------------------------
-    # 🔥 ALIAS PARA COMPATIBILIDAD CON EL PIPELINE INCREMENTAL 🔥
-    # --------------------------------------------------------
-    def save_movimientos(self, df: pd.DataFrame, reset: bool = False) -> int:
-        """
-        Alias corporativo para compatibilidad.
-        Internamente delega al método oficial save_bancos().
-        """
-        return self.save_bancos(df, reset=reset)
-
-
-# ============================================================
-# TEST LOCAL
-# ============================================================
-if __name__ == "__main__":
-    try:
-        from src.extractors.bank_extractor import BankExtractor
-
-        info("Test local de BankWriter…")
-        be = BankExtractor()
-        df = be.get_bancos_mapeados()
-
-        bw = BankWriter()
-        inserted = bw.save_bancos(df, reset=True)
-
-        ok(f"Test BankWriter completo. Insertados: {inserted}")
-
-    except Exception as e:
-        error(f"Fallo en test de BankWriter: {e}")
+    # Alias
+    def save(self, movimientos: List[Dict], reset=False) -> int:
+        return self.save_bancos(movimientos, reset)

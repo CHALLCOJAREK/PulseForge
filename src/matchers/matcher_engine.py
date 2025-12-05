@@ -1,128 +1,127 @@
 # src/matchers/matcher_engine.py
 from __future__ import annotations
-
 import sys
+import time
 from pathlib import Path
+import pandas as pd
 
-# === BOOTSTRAP PARA PODER IMPORTAR src/ ===
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-# ============================================================
-#  PULSEFORGE · MATCHER ENGINE (VERSIÓN LÓGICA SIMPLE PRO)
-# ============================================================
-
-import pandas as pd
-from src.core.logger import info, ok, warn, error
+from src.core.logger import info, ok, warn
+from src.core.env_loader import get_env
+from src.transformers.matcher import Matcher
+from src.transformers.calculator import Calculator
 
 
+# ------------------------------------------------------
+#  BARRA DE PROGRESO LIMPIA
+# ------------------------------------------------------
+def _progress(i: int, total: int, start_time: float) -> str:
+    if total <= 0:
+        return "[--------------------]   0%  ETA: --s"
 
+    pct = min(100, int((i / total) * 100))
+    bars = pct // 5
+
+    elapsed = time.time() - start_time
+    speed = i / elapsed if elapsed > 0 else 1
+    eta = int((total - i) / speed) if speed > 0 else 0
+
+    return f"[{'#' * bars}{'-' * (20 - bars)}] {pct:3d}%  ETA: {eta}s"
+
+
+# ======================================================
 class MatcherEngine:
     """
-    Motor lógico de matching:
-      - Cruza facturas con movimientos bancarios
-      - Reglas simples: RUC, montos, combinada, ventana de fechas
-      - Devuelve DataFrame listo para MatchWriter
+    Motor oficial de Matching PulseForge
+    - Calcula facturas y bancos con Calculator()
+    - Ejecuta Matcher() para cada factura
+    - Guarda TODOS los matches y detalles
+    - Muestra barra de progreso suave (sin logs internos)
     """
 
     def __init__(self):
         info("Inicializando MatcherEngine…")
+        self.matcher = Matcher()
+        self.calc = Calculator()
+        self.days_tol = int(get_env("DAYS_TOLERANCE_PAGO", default=14))
+        self.monto_var = float(get_env("MONTO_VARIACION", default=0.50))
         ok("MatcherEngine listo.")
 
-    # --------------------------------------------------------
-    def _score_match(self, factura_row, mov_row) -> float:
-        score = 0.0
+    # ---------------------------------------------------------
+    def _prepare_facturas(self, df: pd.DataFrame) -> pd.DataFrame:
+        info("Aplicando cálculo contable → facturas")
+        df = self.calc.process_facturas(df)
 
-        # RUC exacto = 40 puntos
-        if str(factura_row.get("ruc")) == str(mov_row.get("destinatario")):
-            score += 40
+        # Crear columna combinada si falta
+        if "combinada" not in df.columns:
+            df["combinada"] = df["serie"].astype(str) + "-" + df["numero"].astype(str)
 
-        # Monto dentro de ± 1% = 40 puntos
-        try:
-            f_total = float(factura_row.get("total_con_igv", 0) or 0)
-            b_monto = float(mov_row.get("monto", 0) or 0)
+        return df
 
-            if f_total == 0:
-                pass
-            else:
-                diff = abs(f_total - b_monto)
-                if diff <= f_total * 0.01:
-                    score += 40
-                elif diff <= f_total * 0.05:
-                    score += 20
-        except:
-            pass
+    # ---------------------------------------------------------
+    def _prepare_bancos(self, df: pd.DataFrame) -> pd.DataFrame:
+        info("Procesando movimientos bancarios…")
+        df = self.calc.process_bancos(df)
 
-        # Fecha exacta = 10 puntos
-        f_fecha = factura_row.get("fecha_emision")
-        b_fecha = mov_row.get("fecha")
+        if "Fecha" not in df.columns:
+            warn("No existe columna Fecha, usando 1970-01-01")
+            df["Fecha"] = pd.to_datetime("1970-01-01")
 
-        if f_fecha and b_fecha and str(f_fecha)[:10] == str(b_fecha)[:10]:
-            score += 10
+        return df
 
-        # Coincidencia por combinada en descripción = 10 puntos
-        comb = str(factura_row.get("combinada") or "").strip()
-        desc = str(mov_row.get("descripcion") or "").lower()
+    # ---------------------------------------------------------
+    def run(self, df_facturas: pd.DataFrame, df_bancos: pd.DataFrame):
+        info("Iniciando motor de matching…")
 
-        if comb and comb.lower() in desc:
-            score += 10
+        if df_facturas.empty:
+            warn("No hay facturas para procesar.")
+            return pd.DataFrame(), pd.DataFrame()
 
-        return score
+        if df_bancos.empty:
+            warn("No hay movimientos bancarios.")
+            return pd.DataFrame(), pd.DataFrame()
 
-    # --------------------------------------------------------
-    def run(self, df_facturas: pd.DataFrame, df_movs: pd.DataFrame) -> pd.DataFrame:
-        """
-        Retorna DataFrame:
-          factura_id, movimiento_id, monto_aplicado, monto_detraccion,
-          variacion, fecha_pago, banco, score, razon_ia, match_tipo, source_hash
-        """
+        # 1) Normalizar
+        df_f = self._prepare_facturas(df_facturas)
+        df_b = self._prepare_bancos(df_bancos)
 
-        if df_facturas.empty or df_movs.empty:
-            warn("No hay facturas o movimientos para ejecutar matching.")
-            return pd.DataFrame()
+        total = len(df_f)
+        start = time.time()
 
-        results = []
+        info(f"🔄 Matching de {total} facturas…\n")
 
-        info("Ejecutando reglas de coincidencia…")
+        match_rows = []
+        detalles_rows = []
 
-        for _, frow in df_facturas.iterrows():
-            mejor_score = 0
-            mejor_mov = None
+        # ---------------------------------------------------------
+        # LOOP PRINCIPAL
+        # ---------------------------------------------------------
+        for i, fac in df_f.iterrows():
 
-            for _, mrow in df_movs.iterrows():
-                sc = self._score_match(frow, mrow)
-                if sc > mejor_score:
-                    mejor_score = sc
-                    mejor_mov = mrow
+            # Barra de progreso limpia
+            bar = _progress(i + 1, total, start)
+            sys.stdout.write(f"\r🔵 {bar}")
+            sys.stdout.flush()
 
-            if mejor_mov is None:
-                continue
+            # Ejecutar matcher para ESTA factura
+            df_match, df_det = self.matcher.match(
+                df_f.loc[[i]],   # factura aislada
+                df_b            # todos los bancos
+            )
 
-            # Variación entre monto factura y movimiento
-            try:
-                f_total = float(frow.get("total_con_igv", 0) or 0)
-                b_monto = float(mejor_mov.get("monto", 0) or 0)
-                variacion = b_monto - f_total
-            except:
-                variacion = None
+            # MULTI-MATCH → se guardan TODOS los candidatos
+            if not df_match.empty:
+                for _, row in df_match.iterrows():
+                    match_rows.append(row.to_dict())
 
-            results.append({
-                "factura_id": frow.get("id"),
-                "movimiento_id": mejor_mov.get("id"),
-                "monto_aplicado": mejor_mov.get("monto"),
-                "monto_detraccion": frow.get("detraccion_monto"),
-                "variacion": variacion,
-                "fecha_pago": mejor_mov.get("fecha"),
-                "banco": mejor_mov.get("banco"),
-                "score": mejor_score,
-                "razon_ia": f"Match estimado por reglas. Score={mejor_score}",
-                "match_tipo": "auto",
-                "source_hash": f"{frow.get('id')}-{mejor_mov.get('id')}"
-            })
+            # DETALLES → se acumulan todos
+            if not df_det.empty:
+                detalles_rows.extend(df_det.to_dict("records"))
 
-        df_out = pd.DataFrame(results)
+        print("\n")
+        ok("🧩 Matching completado.")
 
-        ok(f"MatcherEngine generó {len(df_out)} matches.")
-
-        return df_out
+        return pd.DataFrame(match_rows), pd.DataFrame(detalles_rows)

@@ -1,9 +1,6 @@
 # src/extractors/invoices_extractor.py
 from __future__ import annotations
 
-# ============================================================
-#  EXTRACTOR DE FACTURAS · PULSEFORGE · SQLITE (FINAL)
-# ============================================================
 import sys
 import sqlite3
 from pathlib import Path
@@ -18,94 +15,86 @@ from src.core.env_loader import get_env
 from src.transformers.data_mapper import DataMapper
 
 
-# ------------------------------------------------------------
-def _get_sqlite_connection() -> sqlite3.Connection:
-    db_path = str(get_env("PULSEFORGE_DB_PATH")).strip()
-    if not Path(db_path).exists():
-        error(f"No existe BD origen: {db_path}")
-        raise FileNotFoundError(db_path)
-
-    info(f"Conectando a SQLite → {db_path}")
-    return sqlite3.connect(db_path)
-
-
-# ============================================================
-#  EXTRACTOR
-# ============================================================
 class InvoicesExtractor:
+    """
+    Extrae facturas desde la BD origen (DataPulse) usando el nombre de tabla
+    definido en settings.json. Devuelve lista de diccionarios listos para
+    insertarse en facturas_pf mediante DataMapper.
+    """
 
     def __init__(self):
         info("Inicializando InvoicesExtractor…")
+
         self.mapper = DataMapper()
-
         tablas_cfg = self.mapper.settings.get("tablas", {})
-        self._tabla = tablas_cfg.get("facturas")
+        self.tabla_facturas = tablas_cfg.get("facturas")
 
-        if not self._tabla:
-            error("Falta configuración de tabla facturas en settings.json")
-            raise KeyError("tabla facturas")
+        if not self.tabla_facturas:
+            error("Falta 'facturas' en settings['tablas']")
+            raise KeyError("No existe tabla facturas en configuración.")
 
-        ok(f"InvoicesExtractor listo. Tabla = '{self._tabla}'")
+        ok(f"Tabla de facturas → {self.tabla_facturas}")
+
+    # --------------------------------------------------------
+    def _connect(self):
+        """Conexión limpia a DataPulse SQLite."""
+        db_path = get_env("PULSEFORGE_SOURCE_DB", required=True)
+
+        db_file = Path(db_path)
+        if not db_file.exists():
+            error(f"BD origen no encontrada: {db_file}")
+            raise FileNotFoundError("No existe BD origen")
+
+        return sqlite3.connect(db_file)
 
     # --------------------------------------------------------
     def _load_raw(self) -> pd.DataFrame:
-        conn = _get_sqlite_connection()
+        """Lee data cruda desde DataPulse."""
+        conn = self._connect()
+
         try:
-            info(f"Leyendo facturas desde '{self._tabla}'…")
-            df = pd.read_sql_query(f'SELECT * FROM "{self._tabla}"', conn)
-            ok(f"Facturas crudas leídas: {len(df)} filas.")
+            query = f'SELECT * FROM "{self.tabla_facturas}"'
+            df = pd.read_sql_query(query, conn)
+
+            if df.empty:
+                warn("Tabla de facturas vacía.")
+
             return df
+
+        except Exception as e:
+            error(f"Error leyendo facturas: {e}")
+            raise
         finally:
             conn.close()
 
     # --------------------------------------------------------
-    def _normalize(self, df_raw: pd.DataFrame) -> pd.DataFrame:
-        settings_cols = self.mapper.settings.get("columnas_facturas", {})
+    def _normalize_columns(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+        """
+        Solo copia las columnas que están en settings.json
+        (columnas_facturas). NO hace cálculos ni interpretaciones.
+        """
+        cols_cfg = self.mapper.settings["columnas_facturas"]
         df_norm = pd.DataFrame()
 
-        # COPIAR COLUMNAS REALES
-        for key_std, col_real in settings_cols.items():
+        for col_std, col_real in cols_cfg.items():
             if col_real not in df_raw.columns:
-                warn(f"[FACTURAS] Columna '{col_real}' no existe → vacía.")
-                df_norm[key_std] = None
+                warn(f"[FACTURAS] Falta columna '{col_real}' → se coloca None.")
+                df_norm[col_std] = None
             else:
-                df_norm[key_std] = df_raw[col_real]
+                df_norm[col_std] = df_raw[col_real]
 
-        # RENOMBRAR EXACTO PARA DATAMAPPER
-        rename_map = {
-            "ruc": "RUC",
-            "cliente_generador": "Cliente_Generador",
-            "subtotal": "Subtotal",
-            "serie": "Serie",
-            "numero": "Numero",
-            "combinada": "Combinada",
-            "estado_fs": "Estado_FS",
-            "estado_cont": "Estado_Cont",
-            "fecha_emision": "Fecha_Emision",
-            "forma_pago": "Forma_Pago",
-            "vencimiento": "Vencimiento",
-        }
-
-        df_norm = df_norm.rename(columns=rename_map)
-
-        ok("Facturas normalizadas y renombradas correctamente.")
         return df_norm
 
     # --------------------------------------------------------
-    def get_facturas_mapeadas(self) -> pd.DataFrame:
+    def extract(self) -> list[dict]:
+        """
+        Extrae → normaliza → mapea → devuelve list[dict].
+        """
         df_raw = self._load_raw()
-        df_norm = self._normalize(df_raw)
-        df_mapped = self.mapper.map_facturas(df_norm)
-        ok(f"Facturas mapeadas OK: {len(df_mapped)} filas.")
-        return df_mapped
+        df_norm = self._normalize_columns(df_raw)
 
+        # DataMapper produce una lista de diccionarios ya calculada
+        mapped = self.mapper.map_facturas(df_norm)
 
-# ============================================================
-if __name__ == "__main__":
-    try:
-        extractor = InvoicesExtractor()
-        df = extractor.get_facturas_mapeadas()
-        print(df.head())
-        ok("Test de facturas completado correctamente.")
-    except Exception as e:
-        error(f"Fallo en test de InvoicesExtractor: {e}")
+        ok(f"Facturas extraídas y mapeadas → {len(mapped)} registros.")
+        return mapped

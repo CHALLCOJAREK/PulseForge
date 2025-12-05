@@ -1,12 +1,9 @@
 # src/transformers/data_mapper.py
 from __future__ import annotations
 
-# ============================================================
-#  BOOTSTRAP RUTAS
-# ============================================================
-import os
 import sys
 import pandas as pd
+import hashlib
 from pathlib import Path
 from json import load
 
@@ -15,152 +12,159 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from src.core.logger import info, ok, warn, error
-from src.core.env_loader import get_env
+from src.core.utils import clean_amount
+from src.transformers.calculator import (
+    preparar_factura_para_insert,
+    preparar_movimiento_bancario_para_insert
+)
 
 
-# ============================================================
-#  DATA MAPPER CORPORATIVO · PULSEFORGE V2
-# ============================================================
 class DataMapper:
 
     def __init__(self):
         info("Inicializando DataMapper PulseForge…")
 
-        # Cargar settings.json
         config_path = ROOT / "config" / "settings.json"
         if not config_path.exists():
-            error("settings.json no encontrado — DataMapper NO puede iniciar.")
+            error("settings.json no encontrado — DataMapper no puede iniciar.")
             raise FileNotFoundError("settings.json no encontrado")
 
         with open(config_path, "r", encoding="utf-8") as f:
             self.settings = load(f)
 
+        self.cols_fact = self.settings["columnas_facturas"]
+        self.cols_bank = self.settings["columnas_bancos"]
+        self.map_tablas_bancos = self.settings["tablas_bancos"]
+
         ok("DataMapper cargado correctamente.")
 
+    # ============================================================
+    #  HASH ÚNICO
+    # ============================================================
+    def _make_hash(self, fila: dict) -> str:
+        base = "|".join([str(fila.get(k, "")) for k in sorted(fila.keys())])
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
     # ============================================================
     #  CLIENTES
     # ============================================================
-    def map_clientes(self, df: pd.DataFrame) -> pd.DataFrame:
-        info("Normalizando clientes…")
+    def map_clientes(self, df: pd.DataFrame) -> list[dict]:
+        info("Mapeando clientes…")
 
-        df = df.copy()
+        clientes = []
+        for _, row in df.iterrows():
+            ruc = str(row.get("ruc", "")).strip()
+            rs = str(row.get("razon_social", "")).strip()
 
-        df["RUC"] = df["RUC"].astype(str).str.strip()
-        df["Razon_Social"] = df["Razon_Social"].astype(str).str.strip()
+            if not ruc:
+                continue
 
-        ok(f"Clientes normalizados: {len(df)} registros.")
+            entry = {
+                "ruc": ruc,
+                "razon_social": rs,
+            }
+            entry["source_hash"] = self._make_hash(entry)
+            clientes.append(entry)
 
-        return df[["RUC", "Razon_Social"]]
-
+        ok(f"Clientes mapeados: {len(clientes)}")
+        return clientes
 
     # ============================================================
     #  FACTURAS
     # ============================================================
-    def map_facturas(self, df: pd.DataFrame) -> pd.DataFrame:
-        info("Normalizando facturas…")
+    def map_facturas(self, df: pd.DataFrame) -> list[dict]:
+        info("Mapeando facturas…")
 
-        df = df.copy()
+        facturas = []
+        c = self.cols_fact
 
-        df_std = pd.DataFrame()
+        for _, row in df.iterrows():
+            try:
+                subtotal = clean_amount(row.get(c["subtotal"]))
 
-        # ID base
-        df_std["ruc"] = df["RUC"].astype(str).str.strip()
-        df_std["cliente_generador"] = df["Cliente_Generador"].astype(str).str.strip()
+                factura = preparar_factura_para_insert(
+                    subtotal=subtotal,
+                    extra_campos={
+                        "ruc": str(row.get(c["ruc"], "")).strip(),
+                        "cliente_generador": str(row.get(c["cliente_generador"], "")).strip(),
+                        "serie": str(row.get(c["serie"], "")).strip(),
+                        "numero": str(row.get(c["numero"], "")).strip(),
+                        "combinada": str(row.get(c["combinada"], "")).strip(),
+                        "fecha_emision": str(row.get(c["fecha_emision"], "")),
+                        "vencimiento": str(row.get(c["vencimiento"], "")),
+                    }
+                )
 
-        # Monto base
-        df_std["subtotal"] = pd.to_numeric(df["Subtotal"], errors="coerce")
+                factura["fue_cobrado"] = 0
+                factura["match_id"] = None
+                factura["source_hash"] = self._make_hash(factura)
 
-        df_std["serie"] = df["Serie"].astype(str).str.strip()
-        df_std["numero"] = df["Numero"].astype(str).str.strip()
-        df_std["combinada"] = df["Combinada"].astype(str).str.strip()
+                facturas.append(factura)
 
-        # Estados administrativos
-        df_std["estado_fs"] = df["Estado_FS"].astype(str).str.lower().str.strip()
-        df_std["estado_cont"] = df["Estado_Cont"].astype(str).str.lower().str.strip()
+            except Exception as e:
+                warn(f"Factura con error → {e}")
 
-        # Fechas
-        df_std["fecha_emision"] = pd.to_datetime(df["Fecha_Emision"], errors="coerce")
-        df_std["fecha_limite_pago"] = pd.to_datetime(df["Vencimiento"], errors="coerce")
-
-        # Ventanas dinámicas (procesadas después por calculator)
-        df_std["fecha_inicio_ventana"] = None
-        df_std["fecha_fin_ventana"] = None
-
-        # Valores derivados — se llenan después por calculator
-        df_std["neto_recibido"] = None
-        df_std["total_con_igv"] = None
-        df_std["detraccion_monto"] = None
-
-        ok(f"Facturas normalizadas: {len(df_std)} registros.")
-
-        return df_std
-
+        ok(f"Facturas mapeadas: {len(facturas)}")
+        return facturas
 
     # ============================================================
-    #  BANCOS — COMPATIBLE CON MATCHER ULTRA-BLINDADO
+    #  MOVIMIENTOS BANCARIOS
     # ============================================================
-    def map_bancos(self, df: pd.DataFrame) -> pd.DataFrame:
-        info("Normalizando movimientos bancarios…")
+    def map_bancos(self, df: pd.DataFrame, nombre_tabla: str) -> list[dict]:
+        info(f"Mapeando banco desde tabla '{nombre_tabla}'…")
 
-        df = df.copy()
+        movimientos = []
 
-        # -------------------------------------------
-        # 1) Detección automática de columna Fecha
-        # -------------------------------------------
-        fecha_vars = [c for c in df.columns if "fecha" in c.lower()]
-        if not fecha_vars:
-            error("No existe columna Fecha en bancos.")
-            raise KeyError("df_banco no contiene columna de fecha")
+        # Determinar código de banco
+        banco_codigo = None
+        for cod, tabla_real in self.map_tablas_bancos.items():
+            if tabla_real == nombre_tabla:
+                banco_codigo = cod
+                break
 
-        col_fecha = fecha_vars[0]
-        df["Fecha"] = pd.to_datetime(df[col_fecha], errors="coerce")
+        if not banco_codigo:
+            error(f"No se pudo identificar banco para {nombre_tabla}")
+            return []
 
-        # -------------------------------------------
-        # 2) Mapeo estándar
-        # -------------------------------------------
-        col_map = {
-            "Banco": "Banco",
-            "Descripcion": "Descripcion",
-            "Monto": "Monto",
-            "Moneda": "Moneda",
-            "Operacion": "Operacion",
-            "Tipo_Mov": "tipo_mov",
-            "Destinatario": "destinatario",
-            "Tipo_Documento": "tipo_documento"
-        }
+        # Identificar columnas de operación (pueden ser múltiples)
+        oper_cols = self.cols_bank["operacion"]
 
-        df_std = pd.DataFrame()
+        for _, row in df.iterrows():
+            try:
+                # Monto
+                monto = clean_amount(row.get(self.cols_bank["monto"]))
+                moneda = str(row.get(self.cols_bank["moneda"], "")).upper().strip()
 
-        for old, new in col_map.items():
-            if old in df.columns:
-                df_std[new] = df[old]
-            else:
-                df_std[new] = ""
+                # --- OPERACIÓN PROFESIONAL (multi-columna) ---
+                valor_operacion = ""
+                if isinstance(oper_cols, list):
+                    for col in oper_cols:
+                        if col in row and pd.notna(row[col]):
+                            valor_operacion = str(row[col]).strip()
+                            break
+                else:
+                    valor_operacion = str(row.get(oper_cols, "")).strip()
 
-        df_std["Fecha"] = df["Fecha"]
+                # --- Construcción del movimiento ---
+                movimiento = preparar_movimiento_bancario_para_insert(
+                    monto=monto,
+                    moneda=moneda,
+                    codigo_banco=banco_codigo,
+                    extra_campos={
+                        "fecha": str(row.get(self.cols_bank["fecha"], "")),
+                        "tipo_mov": str(row.get(self.cols_bank["tipo_mov"], "")).strip(),
+                        "descripcion": str(row.get(self.cols_bank["descripcion"], "")).strip(),
+                        "operacion": valor_operacion,
+                        "destinatario": str(row.get(self.cols_bank["destinatario"], "")).strip(),
+                        "tipo_documento": str(row.get(self.cols_bank["tipo_documento"], "")).strip(),
+                    }
+                )
 
-        # -------------------------------------------
-        # 3) Conversión de moneda (opcional)
-        # -------------------------------------------
-        df_std["es_dolares"] = df_std["Moneda"].astype(str).str.upper().str.contains("USD")
+                movimiento["source_hash"] = self._make_hash(movimiento)
+                movimientos.append(movimiento)
 
-        # -------------------------------------------
-        # 4) Reordenar columnas
-        # -------------------------------------------
-        df_std = df_std[[
-            "Banco",
-            "Fecha",
-            "tipo_mov",
-            "Descripcion",
-            "Monto",
-            "Moneda",
-            "Operacion",
-            "es_dolares",
-            "destinatario",
-            "tipo_documento",
-        ]]
+            except Exception as e:
+                warn(f"Movimiento bancario con error → {e}")
 
-        ok(f"Movimientos bancarios normalizados: {len(df_std)} registros.")
-
-        return df_std
+        ok(f"Movimientos mapeados: {len(movimientos)}")
+        return movimientos

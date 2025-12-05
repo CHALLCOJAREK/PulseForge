@@ -1,21 +1,12 @@
 # src/loaders/match_writer.py
 from __future__ import annotations
-
-# ============================================================
-#  PULSEFORGE · MATCH WRITER
-#  Escribe resultados del Matcher en matches_pf
-#  Actualiza estados en facturas_pf
-# ============================================================
 import sys
 import sqlite3
 import hashlib
 from pathlib import Path
-
+from typing import List
 import pandas as pd
 
-# ------------------------------------------------------------
-#  RUTAS
-# ------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -25,7 +16,7 @@ from src.core.env_loader import get_env
 
 
 # ============================================================
-#  HELPERS
+# HELPERS
 # ============================================================
 
 def _get_newdb_path() -> Path:
@@ -44,231 +35,357 @@ def _get_connection() -> sqlite3.Connection:
     return sqlite3.connect(db)
 
 
-def _compute_match_hash(row: pd.Series) -> str:
+def _compute_hash(row: pd.Series) -> str:
+    """
+    Hash único por combinación factura-movimiento-monto_banco.
+    Sirve para deduplicar matches.
+    """
     base = (
-        f"{row.get('factura_id', '')}|"
-        f"{row.get('movimiento_id', '')}|"
-        f"{row.get('monto_aplicado', '')}|"
-        f"{row.get('fecha_pago', '')}|"
-        f"{row.get('banco', '')}"
+        f"{row.get('factura_id','')}|"
+        f"{row.get('movimiento_id','')}|"
+        f"{row.get('monto_banco','')}"
     )
     return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
 
 
-
 # ============================================================
-#  MATCH WRITER
+# MATCH WRITER ENTERPRISE — ALINEADO A newdb_builder
 # ============================================================
 
 class MatchWriter:
 
-    EXPECTED_COLS = [
-        "factura_id",
-        "movimiento_id",
-        "monto_aplicado",
-        "monto_detraccion",
-        "variacion_monto",
-        "fecha_pago",
-        "banco",
-        "score_similitud",
-        "razon_ia",
-        "match_tipo",
-    ]
-
     def __init__(self):
-        info("Inicializando MatchWriter…")
+        info("Inicializando MatchWriter Enterprise…")
         self.db = _get_newdb_path()
-        ok(f"MatchWriter listo. BD destino → {self.db}")
+        ok(f"BD destino → {self.db}")
 
-    # --------------------------------------------------------
+    # ============================================================
     def _ensure_tables(self, conn: sqlite3.Connection):
+        """
+        Crea tablas si no existen. Esquema ALINEADO a newdb_builder.py
+        para evitar incompatibilidades.
+        """
         cur = conn.cursor()
 
-        cur.execute("SELECT name FROM sqlite_master WHERE name='matches_pf'")
-        if not cur.fetchone():
-            error("La tabla 'matches_pf' NO existe. Ejecuta newdb_builder.py")
-            raise RuntimeError("matches_pf no existe")
+        # matches_pf — resumen
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS matches_pf (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                factura_id      INTEGER,
+                movimiento_id   INTEGER,
+                monto_factura   REAL,
+                monto_banco     REAL,
+                diferencia      REAL,
+                match_tipo      TEXT,
+                score           REAL,
+                razon_ia        TEXT,
+                source_hash     TEXT UNIQUE,
+                created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-        cur.execute("SELECT name FROM sqlite_master WHERE name='facturas_pf'")
-        if not cur.fetchone():
-            error("La tabla 'facturas_pf' NO existe. Ejecuta newdb_builder.py")
-            raise RuntimeError("facturas_pf no existe")
+        # match_detalles_pf — trazabilidad
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS match_detalles_pf (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                factura_id          INTEGER,
+                movimiento_id       INTEGER,
+                serie               TEXT,
+                numero              TEXT,
+                combinada           TEXT,
+                ruc                 TEXT,
+                cliente             TEXT,
+                fecha_mov           TEXT,
+                banco_codigo        TEXT,
+                descripcion_banco   TEXT,
+                tipo_comparacion    TEXT,
+                monto_ref           REAL,
+                monto_banco         REAL,
+                diff_monto          REAL,
+                es_detraccion_bn    INTEGER,
+                coincide_fecha      INTEGER,
+                coincide_monto      INTEGER,
+                coincide_nombre     INTEGER,
+                dias_diff_fecha     INTEGER,
+                score_final         REAL,
+                resultado_final     TEXT,
+                created_at          TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    # --------------------------------------------------------
-    #  🔥 NUEVA NORMALIZACIÓN ANTI-None (FIX CRÍTICO)
-    # --------------------------------------------------------
-    def _normalize(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Asegura columnas, limpia None y tipos antes de insertar."""
-        df_norm = df.copy()
+        conn.commit()
 
-        # Asegurar columnas faltantes
-        for col in self.EXPECTED_COLS:
-            if col not in df_norm.columns:
-                warn(f"[MATCH_WRITER] Columna faltante '{col}', se crea vacía.")
-                df_norm[col] = None
+    # ============================================================
+    # NORMALIZACIÓN DE MATCHES → matches_pf
+    # ============================================================
+    def _normalize_matches(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty:
+            warn("df_match vacío en MatchWriter._normalize_matches()")
+            return pd.DataFrame(columns=[
+                "factura_id", "movimiento_id",
+                "monto_factura", "monto_banco",
+                "diferencia", "match_tipo",
+                "score", "razon_ia", "source_hash"
+            ])
 
-        # Convertir NUMÉRICOS → nunca dejar None
-        numeric_cols = [
-            "monto_aplicado",
-            "monto_detraccion",
+        df = df.copy()
+
+        # Asegurar columnas mínimas para cálculo
+        needed = [
+            "factura_id", "movimiento_id",
+            "subtotal", "igv", "total_con_igv", "detraccion_monto",
+            "neto_recibido",
+            "monto_banco", "monto_banco_equivalente",
             "variacion_monto",
-            "score_similitud",
+            "match_tipo", "score_similitud", "razon_ia",
         ]
-        for col in numeric_cols:
-            df_norm[col] = pd.to_numeric(df_norm[col], errors="coerce").fillna(0.0)
+        for col in needed:
+            if col not in df.columns:
+                df[col] = None
 
-        # Convertir FECHAS → string seguro o vacío
-        df_norm["fecha_pago"] = (
-            pd.to_datetime(df_norm["fecha_pago"], errors="coerce")
-            .dt.strftime("%Y-%m-%d")
-            .fillna("")
+        # Numéricos
+        num_cols = [
+            "subtotal", "igv", "total_con_igv", "detraccion_monto",
+            "neto_recibido", "monto_banco", "monto_banco_equivalente",
+            "variacion_monto", "score_similitud"
+        ]
+        for c in num_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+
+        # -----------------------------------------
+        # Monto factura (prioridad):
+        #  1) neto_recibido
+        #  2) total_con_igv
+        #  3) subtotal
+        # -----------------------------------------
+        df["monto_factura"] = df["neto_recibido"]
+        mask = df["monto_factura"] == 0
+        df.loc[mask, "monto_factura"] = df["total_con_igv"]
+        mask = df["monto_factura"] == 0
+        df.loc[mask, "monto_factura"] = df["subtotal"]
+
+        # -----------------------------------------
+        # Monto banco:
+        #  1) monto_banco_equivalente (PEN)
+        #  2) monto_banco
+        # -----------------------------------------
+        df["monto_banco_final"] = df["monto_banco_equivalente"]
+        mask = df["monto_banco_final"] == 0
+        df.loc[mask, "monto_banco_final"] = df["monto_banco"]
+        df["monto_banco"] = df["monto_banco_final"]
+
+        # -----------------------------------------
+        # Diferencia
+        # -----------------------------------------
+        df["diferencia"] = df["variacion_monto"]
+        mask_diff = df["diferencia"].isna() | (df["diferencia"] == 0)
+        df.loc[mask_diff, "diferencia"] = df["monto_banco"] - df["monto_factura"]
+
+        # -----------------------------------------
+        # Campos finales
+        # -----------------------------------------
+        df["match_tipo"] = df["match_tipo"].fillna("")
+        df["score"] = df["score_similitud"].fillna(0.0)
+        df["razon_ia"] = df["razon_ia"].fillna("")
+
+        # Hash único
+        df["source_hash"] = df.apply(_compute_hash, axis=1)
+
+        cols_out = [
+            "factura_id",
+            "movimiento_id",
+            "monto_factura",
+            "monto_banco",
+            "diferencia",
+            "match_tipo",
+            "score",
+            "razon_ia",
+            "source_hash",
+        ]
+        df_out = df[cols_out].copy()
+
+        ok(f"Matches normalizados → {len(df_out)} registros.")
+        return df_out
+
+    # ============================================================
+    # NORMALIZACIÓN DE DETALLES → match_detalles_pf
+    # ============================================================
+    def _normalize_detalles(self, df_det: pd.DataFrame) -> pd.DataFrame:
+        if df_det is None or df_det.empty:
+            warn("df_detalles vacío en MatchWriter._normalize_detalles()")
+            return pd.DataFrame(columns=[
+                "factura_id", "movimiento_id", "serie", "numero",
+                "combinada", "ruc", "cliente", "fecha_mov",
+                "banco_codigo", "descripcion_banco", "tipo_comparacion",
+                "monto_ref", "monto_banco", "diff_monto",
+                "es_detraccion_bn", "coincide_fecha", "coincide_monto",
+                "coincide_nombre", "dias_diff_fecha",
+                "score_final", "resultado_final"
+            ])
+
+        df = df_det.copy()
+
+        # Renombrar posibles nombres antiguos a los nuevos
+        rename_map = {
+            "banco": "banco_codigo",
+            "banco_pago": "banco_codigo",
+            "tipo_monto_ref": "tipo_comparacion",
+            "monto_banco_equivalente": "monto_banco",
+            "match_por_monto": "coincide_monto",
+            "sim_nombre_regla": "coincide_nombre",
+            "dias_diferencia_fecha": "dias_diff_fecha",
+        }
+        df.rename(
+            columns={k: v for k, v in rename_map.items() if k in df.columns},
+            inplace=True,
         )
 
-        # Convertir STRING columns → sin None
-        text_cols = ["razon_ia", "match_tipo", "banco"]
-        for col in text_cols:
-            df_norm[col] = (
-                df_norm[col]
-                .astype(str)
-                .replace("None", "")
-                .replace("nan", "")
-                .fillna("")
-            )
+        needed = [
+            "factura_id", "movimiento_id",
+            "serie", "numero", "combinada",
+            "ruc", "cliente",
+            "fecha_mov", "banco_codigo",
+            "descripcion_banco",
+            "tipo_comparacion",
+            "monto_ref", "monto_banco", "diff_monto",
+            "es_detraccion_bn",
+            "coincide_fecha", "coincide_monto", "coincide_nombre",
+            "dias_diff_fecha",
+            "score_final", "resultado_final",
+        ]
 
-        # Hash único por match
-        df_norm["source_hash"] = df_norm.apply(_compute_match_hash, axis=1)
+        for col in needed:
+            if col not in df.columns:
+                df[col] = None
 
-        return df_norm
+        # Numéricos
+        num_cols = [
+            "monto_ref", "monto_banco", "diff_monto",
+            "es_detraccion_bn",
+            "coincide_fecha", "coincide_monto", "coincide_nombre",
+            "dias_diff_fecha",
+            "score_final",
+        ]
+        for c in num_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # --------------------------------------------------------
-    def save_matches(self, df: pd.DataFrame, reset=False) -> int:
-        df_norm = self._normalize(df)
+        # Flags 0/1
+        for c in ["es_detraccion_bn", "coincide_fecha", "coincide_monto", "coincide_nombre"]:
+            df[c] = df[c].fillna(0).astype(int)
 
+        df_out = df[needed].copy()
+        ok(f"Detalles normalizados → {len(df_out)} registros.")
+        return df_out
+
+    # ============================================================
+    # API PÚBLICA
+    # ============================================================
+    def save(self, df_match: pd.DataFrame, df_detalles: pd.DataFrame, reset: bool = False) -> int:
+        """
+        Inserta resultados en:
+          - matches_pf         (resumen)
+          - match_detalles_pf  (trazabilidad)
+        Retorna cantidad de matches guardados.
+        """
         conn = _get_connection()
         self._ensure_tables(conn)
         cur = conn.cursor()
 
         if reset:
-            warn("Reset=True → limpiando tabla matches_pf")
+            warn("Reset=True → limpiando tablas matches_pf y match_detalles_pf")
             cur.execute("DELETE FROM matches_pf")
+            cur.execute("DELETE FROM match_detalles_pf")
 
-        info("Insertando registros de match en matches_pf…")
+        # -------------------------
+        # 1. Matches (resumen)
+        # -------------------------
+        df_norm = self._normalize_matches(df_match)
+        if not df_norm.empty:
+            cur.executemany("""
+                INSERT OR REPLACE INTO matches_pf (
+                    factura_id,
+                    movimiento_id,
+                    monto_factura,
+                    monto_banco,
+                    diferencia,
+                    match_tipo,
+                    score,
+                    razon_ia,
+                    source_hash
+                )
+                VALUES (
+                    :factura_id,
+                    :movimiento_id,
+                    :monto_factura,
+                    :monto_banco,
+                    :diferencia,
+                    :match_tipo,
+                    :score,
+                    :razon_ia,
+                    :source_hash
+                )
+            """, df_norm.to_dict(orient="records"))
 
-        rows = df_norm.to_dict(orient="records")
+            ok(f"Matches insertados: {len(df_norm)}")
 
-        cur.executemany("""
-            INSERT INTO matches_pf (
-                factura_id,
-                movimiento_id,
-                monto_aplicado,
-                monto_detraccion,
-                variacion,
-                fecha_pago,
-                banco,
-                score,
-                razon_ia,
-                match_tipo,
-                source_hash
-            )
-            VALUES (
-                :factura_id,
-                :movimiento_id,
-                :monto_aplicado,
-                :monto_detraccion,
-                :variacion_monto,
-                :fecha_pago,
-                :banco,
-                :score_similitud,
-                :razon_ia,
-                :match_tipo,
-                :source_hash
-            )
-        """, rows)
+        # -------------------------
+        # 2. Detalles
+        # -------------------------
+        if df_detalles is not None and not df_detalles.empty:
+            df_det_norm = self._normalize_detalles(df_detalles)
 
-        conn.commit()
-        ok(f"Matches insertados: {len(rows)}")
+            cur.executemany("""
+                INSERT INTO match_detalles_pf (
+                    factura_id,
+                    movimiento_id,
+                    serie,
+                    numero,
+                    combinada,
+                    ruc,
+                    cliente,
+                    fecha_mov,
+                    banco_codigo,
+                    descripcion_banco,
+                    tipo_comparacion,
+                    monto_ref,
+                    monto_banco,
+                    diff_monto,
+                    es_detraccion_bn,
+                    coincide_fecha,
+                    coincide_monto,
+                    coincide_nombre,
+                    dias_diff_fecha,
+                    score_final,
+                    resultado_final
+                )
+                VALUES (
+                    :factura_id,
+                    :movimiento_id,
+                    :serie,
+                    :numero,
+                    :combinada,
+                    :ruc,
+                    :cliente,
+                    :fecha_mov,
+                    :banco_codigo,
+                    :descripcion_banco,
+                    :tipo_comparacion,
+                    :monto_ref,
+                    :monto_banco,
+                    :diff_monto,
+                    :es_detraccion_bn,
+                    :coincide_fecha,
+                    :coincide_monto,
+                    :coincide_nombre,
+                    :dias_diff_fecha,
+                    :score_final,
+                    :resultado_final
+                )
+            """, df_det_norm.to_dict(orient="records"))
 
-        # Después de insertar → actualizar facturas_pf
-        self._update_facturas_status(conn)
+            ok(f"Detalles insertados: {len(df_det_norm)}")
 
         conn.commit()
         conn.close()
-        return len(rows)
 
-    # --------------------------------------------------------
-    def _update_facturas_status(self, conn: sqlite3.Connection):
-        """Actualiza facturas_pf según montos cobrados."""
-
-        info("Actualizando estados en facturas_pf…")
-        cur = conn.cursor()
-
-        # Obtener totales de matches por factura
-        cur.execute("""
-            SELECT factura_id, SUM(monto_aplicado) AS cobrado
-            FROM matches_pf
-            GROUP BY factura_id
-        """)
-
-        for factura_id, cobrado_total in cur.fetchall():
-
-            # Monto original
-            cur.execute("""
-                SELECT subtotal FROM facturas_pf
-                WHERE id = ?
-            """, (factura_id,))
-            monto_factura = cur.fetchone()
-
-            if not monto_factura:
-                warn(f"Factura {factura_id} no encontrada en facturas_pf")
-                continue
-
-            monto_factura = float(monto_factura[0])
-            cobrado_total = float(cobrado_total or 0)
-
-            if cobrado_total >= monto_factura - 0.01:
-                estado = "COBRADO"
-            elif 0 < cobrado_total < monto_factura:
-                estado = "PARCIAL"
-            else:
-                estado = "PENDIENTE"
-
-            cur.execute("""
-                UPDATE facturas_pf
-                SET estado_pago = ?,
-                    monto_cobrado = ?
-                WHERE id = ?
-            """, (estado, cobrado_total, factura_id))
-
-        ok("Estados de facturas actualizados correctamente.")
-
-
-# ============================================================
-#  TEST LOCAL
-# ============================================================
-if __name__ == "__main__":
-    try:
-        info("⚙️ Test local de MatchWriter…")
-
-        # Aquí simulamos matches (en tu pipeline vendrán del matcher real)
-        df_test = pd.DataFrame([
-            {
-                "factura_id": 1,
-                "movimiento_id": 10,
-                "monto_aplicado": 500,
-                "monto_detraccion": 0,
-                "variacion_monto": 0.02,
-                "fecha_pago": "2025-01-20",
-                "banco": "BBVA",
-                "score_similitud": 0.92,
-                "razon_ia": "Coincidencia semántica de cliente",
-                "match_tipo": "semantico"
-            }
-        ])
-
-        writer = MatchWriter()
-        writer.save_matches(df_test, reset=True)
-
-        ok("Test de MatchWriter completado correctamente.")
-
-    except Exception as e:
-        error(f"Fallo en test de MatchWriter: {e}")
+        return len(df_norm)

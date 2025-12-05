@@ -1,32 +1,28 @@
 # src/core/env_loader.py
 from __future__ import annotations
 
-# --- BOOTSTRAP PARA EJECUTAR DESDE CUALQUIER PARTE ---
+# --- BOOTSTRAP PARA QUE FUNCIONE DESDE CUALQUIER RUTA ---
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
-# ------------------------------------------------------
+# ---------------------------------------------------------
 
 import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
-
-# -----------------------------
-#  LOGGING CORPORATIVO
-# -----------------------------
-def info(msg): print(f"🔵 {msg}")
-def ok(msg): print(f"🟢 {msg}")
-def warn(msg): print(f"🟡 {msg}")
-def error(msg): print(f"🔴 {msg}")
+# ---------------------------
+#  LOGGING CORPORATIVO REAL
+# ---------------------------
+from src.core.logger import info, ok, warn, error
 
 
-# -----------------------------
-#  ERRORES DE CONFIGURACIÓN
-# -----------------------------
+# ---------------------------
+#  ERRORES ESPECÍFICOS DE ENV
+# ---------------------------
 class EnvConfigError(Exception):
     pass
 
@@ -34,11 +30,10 @@ class EnvConfigError(Exception):
 _ENV_LOADED = False
 
 
-# -----------------------------
+# ---------------------------
 #  CARGA DEL ARCHIVO .env
-# -----------------------------
+# ---------------------------
 def _load_env_file(dotenv_path: Optional[Path] = None) -> None:
-    """Carga las variables del archivo .env sin dependencias externas."""
     global _ENV_LOADED
     if _ENV_LOADED:
         return
@@ -61,7 +56,6 @@ def _load_env_file(dotenv_path: Optional[Path] = None) -> None:
                 key, value = line.split("=", 1)
                 key = key.strip()
                 value = value.strip().strip('"').strip("'")
-
                 os.environ.setdefault(key, value)
 
         ok(f".env cargado correctamente desde: {dotenv_path}")
@@ -72,9 +66,9 @@ def _load_env_file(dotenv_path: Optional[Path] = None) -> None:
     _ENV_LOADED = True
 
 
-# -----------------------------
-#  CASTEOS SEGUROS
-# -----------------------------
+# ---------------------------
+#  CASTEOS Y VALIDACIONES
+# ---------------------------
 def _cast_bool(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
@@ -89,9 +83,9 @@ def _cast_value(raw: str, t: type) -> Any:
     return raw
 
 
-# -----------------------------
-#  LECTOR SEMIESTRICTO DEL ENV
-# -----------------------------
+# ---------------------------
+#  LECTOR PRINCIPAL GET_ENV
+# ---------------------------
 def get_env(
     key: str,
     *,
@@ -117,35 +111,43 @@ def get_env(
         raise EnvConfigError(f"Error casteando {key}: {e}")
 
 
-# -----------------------------
-#  MODELO DE CONFIGURACIÓN
-# -----------------------------
+# ---------------------------
+#  MODELO CENTRAL DE CONFIG
+# ---------------------------
 @dataclass
 class PulseForgeConfig:
-    # Críticas
+
+    # BASES DE DATOS
     db_type: str
-    db_path: str
-    newdb_path: str
+    db_source_path: str         # <-- DataPulse
+    db_path: str                # <-- PulseForge actual
+    newdb_path: str             # <-- PulseForge destino
+
+    # CONTABILIDAD
     detraccion_porcentaje: float
     igv: float
     days_tolerance_pago: int
     monto_variacion: float
-
-    # Opcionales
     tipo_cambio_usd_pen: float
+
+    # BANCOS
     cuenta_empresa: Optional[str]
     cuenta_detraccion: Optional[str]
+
+    # IA
     activar_ia: bool
-    modo_debug: bool
     api_gemini_key: Optional[str]
+
+    # OTROS
+    modo_debug: bool
 
 
 _CONFIG_CACHE: Optional[PulseForgeConfig] = None
 
 
-# -----------------------------
+# ---------------------------
 #  CARGA PRINCIPAL DE CONFIG
-# -----------------------------
+# ---------------------------
 def load_pulseforge_config(force_reload: bool = False) -> PulseForgeConfig:
     global _CONFIG_CACHE
     if _CONFIG_CACHE is not None and not force_reload:
@@ -154,26 +156,34 @@ def load_pulseforge_config(force_reload: bool = False) -> PulseForgeConfig:
     info("Cargando configuración de PulseForge…")
 
     db_type = get_env("PULSEFORGE_DB_TYPE", required=True).lower()
-    if db_type not in ("sqlite", "mysql", "postgres"):
+    if db_type not in ("sqlite", "postgres", "mysql"):
         raise EnvConfigError(f"PULSEFORGE_DB_TYPE inválido: {db_type}")
 
     cfg = PulseForgeConfig(
-        # CRÍTICAS
+
+        # BASES DE DATOS
         db_type=db_type,
+        db_source_path=get_env("PULSEFORGE_SOURCE_DB", required=True),
         db_path=get_env("PULSEFORGE_DB_PATH", required=True),
         newdb_path=get_env("PULSEFORGE_NEWDB_PATH", required=True),
+
+        # CONTABILIDAD
         detraccion_porcentaje=get_env("DETRACCION_PORCENTAJE", required=True, cast_type=float),
         igv=get_env("IGV", required=True, cast_type=float),
         days_tolerance_pago=get_env("DAYS_TOLERANCE_PAGO", required=True, cast_type=int),
         monto_variacion=get_env("MONTO_VARIACION", required=True, cast_type=float),
-
-        # OPCIONALES
         tipo_cambio_usd_pen=get_env("TIPO_CAMBIO_USD_PEN", default=3.80, cast_type=float),
+
+        # BANCOS
         cuenta_empresa=get_env("CUENTA_EMPRESA", default="") or None,
         cuenta_detraccion=get_env("CUENTA_DETRACCION", default="") or None,
+
+        # IA
         activar_ia=get_env("ACTIVAR_IA", default=True, cast_type=bool),
-        modo_debug=get_env("MODO_DEBUG", default=False, cast_type=bool),
         api_gemini_key=get_env("API_GEMINI_KEY", default="") or None,
+
+        # OTROS
+        modo_debug=get_env("MODO_DEBUG", default=False, cast_type=bool),
     )
 
     ok("Configuración cargada correctamente.")
@@ -185,40 +195,12 @@ def get_config() -> PulseForgeConfig:
     return load_pulseforge_config()
 
 
-# -----------------------------
-#  BLOQUE DE PRUEBA PROFESIONAL
-# -----------------------------
+# ---------------------------
+#  TEST INTERNO
+# ---------------------------
 if __name__ == "__main__":
-    info("Iniciando prueba de env_loader.py…")
-    try:
-        cfg = load_pulseforge_config()
-        ok("PRUEBA EXITOSA — Configuración cargada.\n")
+    cfg = load_pulseforge_config(force_reload=True)
 
-        print("====================================================")
-        print("        ⚙️  CONFIGURACIÓN PULSEFORGE (ENV)")
-        print("====================================================\n")
-
-        print("🔶 VARIABLES CRÍTICAS")
-        print(f"   • DB Type                : {cfg.db_type}")
-        print(f"   • Ruta DB origen         : {cfg.db_path}")
-        print(f"   • Ruta DB nueva          : {cfg.newdb_path}")
-        print(f"   • IGV                    : {cfg.igv}")
-        print(f"   • % Detracción           : {cfg.detraccion_porcentaje}")
-        print(f"   • Tolerancia Fecha (días): {cfg.days_tolerance_pago}")
-        print(f"   • Tolerancia Monto       : {cfg.monto_variacion}\n")
-
-        print("🔷 VARIABLES OPCIONALES")
-        print(f"   • TC USD→PEN             : {cfg.tipo_cambio_usd_pen}")
-        print(f"   • Cuenta Empresa         : {cfg.cuenta_empresa}")
-        print(f"   • Cuenta Detracción      : {cfg.cuenta_detraccion}")
-        print(f"   • IA Activada            : {cfg.activar_ia}")
-        print(f"   • Modo Debug             : {cfg.modo_debug}")
-        print(f"   • Gemini API Key         : {'✔ OK' if cfg.api_gemini_key else '— Sin clave'}\n")
-
-        print("====================================================")
-        print("        🟢 CONFIGURACIÓN COMPLETA")
-        print("====================================================\n")
-
-    except EnvConfigError as e:
-        error("ERROR EN PRUEBA DE ENV LOADER:")
-        error(str(e))
+    info("===== CONFIGURACIÓN CARGADA =====")
+    for field, value in cfg.__dict__.items():
+        print(f"{field}: {value}")

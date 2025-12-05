@@ -11,6 +11,9 @@ import sqlite3
 from pathlib import Path
 import pandas as pd
 
+# ------------------------------------------------------------
+#  BOOTSTRAP RUTAS
+# ------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -18,8 +21,8 @@ if str(ROOT) not in sys.path:
 from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
 
-# Extractores/Loaders
-from src.matchers.matcher_engine import MatcherEngine     # tú ya lo tienes
+# Motor y Writer oficiales
+from src.matchers.matcher_engine import MatcherEngine
 from src.loaders.match_writer import MatchWriter
 
 
@@ -42,7 +45,7 @@ def _get_conn_pf() -> sqlite3.Connection:
 
 
 # ============================================================
-#  PIPELINE MATCHER
+#  PIPELINE MATCHER — MOTOR PRINCIPAL
 # ============================================================
 class PipelineMatcher:
 
@@ -51,7 +54,7 @@ class PipelineMatcher:
 
         self.conn = _get_conn_pf()
         self.writer = MatchWriter()
-        self.matcher = MatcherEngine()          # motor de matching
+        self.matcher = MatcherEngine()
 
         ok("PipelineMatcher listo.")
 
@@ -85,7 +88,7 @@ class PipelineMatcher:
         Ejecuta matching completo:
         - Lee facturas + movimientos
         - Llama al motor inteligente
-        - Inserta matches
+        - Inserta matches + detalles
         """
         info("🚀 Ejecutando PipelineMatcher…")
 
@@ -96,18 +99,25 @@ class PipelineMatcher:
             error("No se puede ejecutar el matcher: faltan datos.")
             return 0
 
+        # Ejecutar motor de matching
         info("🤖 Ejecutando motor de Matching IA/Reglas…")
-        try:
-            df_matches = self.matcher.run(df_fact, df_mov)
 
+        try:
+            df_matches, df_detalles = self.matcher.run(df_fact, df_mov)
         except Exception as e:
             error(f"Error ejecutando matcher: {e}")
             raise
 
         ok(f"Matches generados: {len(df_matches)}")
 
-        info("💾 Guardando matches en matches_pf…")
-        inserted = self.writer.save_matches(df_matches, reset=reset)
+        # Guardar en BD
+        info("💾 Guardando matches y detalles en matches_pf…")
+
+        inserted = self.writer.save(
+            df_match=df_matches,
+            df_detalles=df_detalles,
+            reset=reset
+        )
 
         ok(f"Pipeline de Matching completado → {inserted} registros.")
         return inserted
@@ -122,6 +132,5 @@ if __name__ == "__main__":
         pipeline = PipelineMatcher()
         inserted = pipeline.run(reset=True)
         ok(f"Test PipelineMatcher OK → {inserted} matches insertados.")
-
     except Exception as e:
         error(f"Fallo en test de PipelineMatcher: {e}")
