@@ -44,7 +44,6 @@ def hacer_backup():
     # Contar archivos
     total_archivos = 0
     for ruta_actual, subdirs, files in os.walk(origen):
-        # Saltar carpetas ignoradas
         if any(ign in ruta_actual for ign in CARPETAS_IGNORADAS):
             continue
         total_archivos += len(files)
@@ -53,10 +52,8 @@ def hacer_backup():
         print("❌ No hay archivos para copiar.")
         return
 
-    # Crear carpeta destino
     os.makedirs(destino, exist_ok=True)
 
-    # Copiar con progreso
     archivos_copiados = 0
     for ruta_actual, subdirs, files in os.walk(origen):
 
@@ -74,8 +71,8 @@ def hacer_backup():
             try:
                 shutil.copy2(origen_file, destino_file)
                 archivos_copiados += 1
-
                 porcentaje = (archivos_copiados / total_archivos) * 100
+
                 sys.stdout.write(f"\r📦 Copiando archivos… {porcentaje:6.2f}%")
                 sys.stdout.flush()
 
@@ -97,33 +94,28 @@ def escribir_estructura():
     for carpeta_raiz, subdirs, files in os.walk(root):
         rel = os.path.relpath(carpeta_raiz, root)
 
-        # Ignorar contenido de carpetas ignoradas
         if any(rel.split(os.sep)[0] == ign for ign in CARPETAS_IGNORADAS):
             continue
 
-        # Manejo especial .git → solo nivel 1 y 2
         partes = rel.split(os.sep)
         carpeta_top = partes[0]
 
         if carpeta_top in CARPETAS_NIVEL_LIMITADO:
             nivel = len(partes)
 
-            if nivel == 1:  # Solo mostrar la carpeta
+            if nivel == 1:
                 lines.append(f"📂 {carpeta_top}  (contenido limitado)\n")
-            elif nivel == 2:  # Mostrar nivel 2
+            elif nivel == 2:
                 indent = " ┃ "
                 lines.append(f"{indent}📂 {partes[1]}\n")
 
-            # No mostrar más niveles
             continue
 
-        # Carpeta normal
         if rel != ".":
             indent = " ┃ " * (rel.count(os.sep))
             folder_name = os.path.basename(carpeta_raiz)
             lines.append(f"{indent}📂 {folder_name}\n")
 
-        # Archivos
         for archivo in files:
             indent = " ┃ " * (rel.count(os.sep))
             lines.append(f"{indent} ┣ 📜 {archivo}\n")
@@ -135,7 +127,10 @@ def escribir_estructura():
 
 
 # ======================================================
-# PROCESO PRINCIPAL
+# PROCESO PRINCIPAL — ORDEN CORRECTO
+# 1) Estructura
+# 2) Git push
+# 3) Backup
 # ======================================================
 if __name__ == "__main__":
     mensaje = f"Auto-commit {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -146,22 +141,20 @@ if __name__ == "__main__":
 
     print("📌  Inicializando proceso...\n")
 
-    # 1) ADD
-    print("📂  Añadiendo archivos…")
+    # 1) ESTRUCTURA
+    escribir_estructura()
+
+    # 2) GIT
+    print("\n📂  Añadiendo archivos…")
     run("git add .", "Archivos añadidos al stage")
 
-    # 2) COMMIT
     print("\n📝  Creando commit…")
     run(f'git commit -m "{mensaje}"', "Commit creado")
 
-    # 3) PUSH
     print("\n🚀  Subiendo cambios al repositorio remoto…")
     run("git push", "Push completado")
 
-    # 4) BACKUP
+    # 3) BACKUP
     hacer_backup()
 
-    # 5) ESTRUCTURA
-    escribir_estructura()
-
-    print("\n✨  Todo ok, Jarek. Repo actualizado + Backup asegurado + Estructura lista.\n")
+    print("\n✨  Todo ok, Jarek. Estructura primero + Git al día + Backup asegurado.\n")

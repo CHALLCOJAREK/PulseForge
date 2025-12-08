@@ -73,13 +73,6 @@
  ┃  ┣ 📜 pipeline_clients.py
  ┃  ┣ 📜 pipeline_facturas.py
  ┃  ┣ 📜 pipeline_matcher.py
- ┃  ┃ 📂 __pycache__
- ┃  ┃  ┣ 📜 full_run.cpython-311.pyc
- ┃  ┃  ┣ 📜 incremental.cpython-311.pyc
- ┃  ┃  ┣ 📜 pipeline_bancos.cpython-311.pyc
- ┃  ┃  ┣ 📜 pipeline_clients.cpython-311.pyc
- ┃  ┃  ┣ 📜 pipeline_facturas.cpython-311.pyc
- ┃  ┃  ┣ 📜 pipeline_matcher.cpython-311.pyc
  ┃ 📂 reports
  ┃  ┣ 📜 excel_reporter.py
  ┃  ┣ 📜 summary_reporter.py
@@ -93,5 +86,3 @@
  ┃  ┃  ┣ 📜 calculator.cpython-311.pyc
  ┃  ┃  ┣ 📜 data_mapper.cpython-311.pyc
  ┃  ┃  ┣ 📜 matcher.cpython-311.pyc
- ┃ 📂 __pycache__
- ┃  ┣ 📜 main.cpython-311.pyc
