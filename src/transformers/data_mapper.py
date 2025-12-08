@@ -38,16 +38,20 @@ class DataMapper:
 
         ok("DataMapper cargado correctamente.")
 
-    # ============================================================
-    #  HASH ÚNICO
-    # ============================================================
+    # ================================================
+    # HASH ÚNICO
+    # ================================================
     def _make_hash(self, fila: dict) -> str:
-        base = "|".join([str(fila.get(k, "")) for k in sorted(fila.keys())])
-        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+        try:
+            base = "|".join([str(fila.get(k, "")) for k in sorted(fila.keys())])
+            return hashlib.sha256(base.encode("utf-8")).hexdigest()
+        except Exception as e:
+            warn(f"Error generando hash: {e}")
+            return ""
 
-    # ============================================================
-    #  CLIENTES
-    # ============================================================
+    # ================================================
+    # CLIENTES
+    # ================================================
     def map_clientes(self, df: pd.DataFrame) -> list[dict]:
         info("Mapeando clientes…")
 
@@ -62,16 +66,17 @@ class DataMapper:
             entry = {
                 "ruc": ruc,
                 "razon_social": rs,
+                "source_hash": self._make_hash({"ruc": ruc, "razon_social": rs})
             }
-            entry["source_hash"] = self._make_hash(entry)
+
             clientes.append(entry)
 
         ok(f"Clientes mapeados: {len(clientes)}")
         return clientes
 
-    # ============================================================
-    #  FACTURAS
-    # ============================================================
+    # ================================================
+    # FACTURAS
+    # ================================================
     def map_facturas(self, df: pd.DataFrame) -> list[dict]:
         info("Mapeando facturas…")
 
@@ -107,45 +112,40 @@ class DataMapper:
         ok(f"Facturas mapeadas: {len(facturas)}")
         return facturas
 
-    # ============================================================
-    #  MOVIMIENTOS BANCARIOS
-    # ============================================================
+    # ================================================
+    # MOVIMIENTOS BANCARIOS
+    # ================================================
     def map_bancos(self, df: pd.DataFrame, nombre_tabla: str) -> list[dict]:
         info(f"Mapeando banco desde tabla '{nombre_tabla}'…")
 
         movimientos = []
 
-        # Determinar código de banco
-        banco_codigo = None
-        for cod, tabla_real in self.map_tablas_bancos.items():
-            if tabla_real == nombre_tabla:
-                banco_codigo = cod
-                break
+        banco_codigo = next(
+            (cod for cod, tabla_real in self.map_tablas_bancos.items() if tabla_real == nombre_tabla),
+            None
+        )
 
         if not banco_codigo:
             error(f"No se pudo identificar banco para {nombre_tabla}")
             return []
 
-        # Identificar columnas de operación (pueden ser múltiples)
         oper_cols = self.cols_bank["operacion"]
 
         for _, row in df.iterrows():
             try:
-                # Monto
                 monto = clean_amount(row.get(self.cols_bank["monto"]))
                 moneda = str(row.get(self.cols_bank["moneda"], "")).upper().strip()
 
-                # --- OPERACIÓN PROFESIONAL (multi-columna) ---
+                # operación profesional multi-columna
                 valor_operacion = ""
                 if isinstance(oper_cols, list):
-                    for col in oper_cols:
-                        if col in row and pd.notna(row[col]):
-                            valor_operacion = str(row[col]).strip()
-                            break
+                    valor_operacion = next(
+                        (str(row[col]).strip() for col in oper_cols if col in row and pd.notna(row[col])),
+                        ""
+                    )
                 else:
                     valor_operacion = str(row.get(oper_cols, "")).strip()
 
-                # --- Construcción del movimiento ---
                 movimiento = preparar_movimiento_bancario_para_insert(
                     monto=monto,
                     moneda=moneda,

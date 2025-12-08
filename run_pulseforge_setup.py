@@ -1,6 +1,7 @@
 # run_pulseforge_setup.py
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 # =====================================================
@@ -34,7 +35,13 @@ def run(title, rel_path):
         print(f"❌ ERROR: No se encontró el archivo → {file_path}")
         sys.exit(1)
 
-    result = subprocess.run([sys.executable, str(file_path)])
+    # FIX DEFINITIVO: subprocess con PYTHONPATH correcto
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{str(ROOT)};{str(SRC)}"
+    }
+
+    result = subprocess.run([sys.executable, str(file_path)], env=env)
 
     if result.returncode != 0:
         print(f"\n❌ ERROR ejecutando {title}\n")
