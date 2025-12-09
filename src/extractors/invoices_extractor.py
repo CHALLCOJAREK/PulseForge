@@ -11,47 +11,49 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from src.core.logger import info, ok, warn, error
-from src.core.env_loader import get_env
+from src.core.env_loader import get_config
+from src.core.utils import parse_date, clean_amount
 from src.transformers.data_mapper import DataMapper
 
 
 class InvoicesExtractor:
-    """
-    Extrae facturas desde la BD origen (DataPulse) usando el nombre de tabla
-    definido en settings.json. Devuelve lista de diccionarios listos para
-    insertarse en facturas_pf mediante DataMapper.
-    """
 
     def __init__(self):
         info("Inicializando InvoicesExtractor…")
 
+        # Config centralizada
+        self.cfg = get_config()
+
+        # DataMapper (solo para mapeos)
         self.mapper = DataMapper()
-        tablas_cfg = self.mapper.settings.get("tablas", {})
-        self.tabla_facturas = tablas_cfg.get("facturas")
+
+        # Tabla de facturas
+        self.tabla_facturas = self.cfg.tablas.get("facturas")
 
         if not self.tabla_facturas:
-            error("Falta 'facturas' en settings['tablas']")
+            error("Falta 'facturas' en config.tablas")
             raise KeyError("No existe tabla facturas en configuración.")
 
-        ok(f"Tabla de facturas → {self.tabla_facturas}")
+        ok(f"Tabla de facturas configurada → {self.tabla_facturas}")
+
+        # Columnas dinámicas desde settings.json
+        self.cols_cfg = self.cfg.columnas_facturas
+
 
     # --------------------------------------------------------
     def _connect(self):
-        """Conexión limpia a DataPulse SQLite."""
-        db_path = get_env("PULSEFORGE_SOURCE_DB", required=True)
+        db_path = self.cfg.db_source
+        file = Path(db_path)
 
-        db_file = Path(db_path)
-        if not db_file.exists():
-            error(f"BD origen no encontrada: {db_file}")
+        if not file.exists():
+            error(f"BD origen no encontrada: {file}")
             raise FileNotFoundError("No existe BD origen")
 
-        return sqlite3.connect(db_file)
+        return sqlite3.connect(file)
 
     # --------------------------------------------------------
     def _load_raw(self) -> pd.DataFrame:
-        """Lee data cruda desde DataPulse."""
         conn = self._connect()
-
         try:
             query = f'SELECT * FROM "{self.tabla_facturas}"'
             df = pd.read_sql_query(query, conn)
@@ -64,37 +66,56 @@ class InvoicesExtractor:
         except Exception as e:
             error(f"Error leyendo facturas: {e}")
             raise
+
         finally:
             conn.close()
 
     # --------------------------------------------------------
-    def _normalize_columns(self, df_raw: pd.DataFrame) -> pd.DataFrame:
-        """
-        Solo copia las columnas que están en settings.json
-        (columnas_facturas). NO hace cálculos ni interpretaciones.
-        """
-        cols_cfg = self.mapper.settings["columnas_facturas"]
-        df_norm = pd.DataFrame()
+    def _normalize_df(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+        """Selecciona columnas reales basadas en settings.columnas_facturas."""
+        df = pd.DataFrame()
 
-        for col_std, col_real in cols_cfg.items():
-            if col_real not in df_raw.columns:
-                warn(f"[FACTURAS] Falta columna '{col_real}' → se coloca None.")
-                df_norm[col_std] = None
+        for col_std, posibles in self.cols_cfg.items():
+
+            if isinstance(posibles, list):
+                col_real = next((c for c in posibles if c in df_raw.columns), None)
             else:
-                df_norm[col_std] = df_raw[col_real]
+                col_real = posibles if posibles in df_raw.columns else None
 
-        return df_norm
+            if not col_real:
+                warn(f"[FACTURAS] Falta columna '{col_std}' → None")
+                df[col_std] = None
+            else:
+                df[col_std] = df_raw[col_real]
+
+        return df
+
+    # --------------------------------------------------------
+    def _fix_dates(self, df: pd.DataFrame, campos: list[str]):
+        """Parsea fechas sin romper el proceso."""
+        for campo in campos:
+            if campo in df.columns:
+                df[campo] = df[campo].apply(
+                    lambda x: parse_date(x) if x not in (None, "", "nan", "0") else None
+                )
+
+        return df
 
     # --------------------------------------------------------
     def extract(self) -> list[dict]:
-        """
-        Extrae → normaliza → mapea → devuelve list[dict].
-        """
-        df_raw = self._load_raw()
-        df_norm = self._normalize_columns(df_raw)
 
-        # DataMapper produce una lista de diccionarios ya calculada
-        mapped = self.mapper.map_facturas(df_norm)
+        df_raw = self._load_raw()
+        df = self._normalize_df(df_raw)
+
+        # Fechas
+        df = self._fix_dates(df, ["fecha_emision", "vencimiento"])
+
+        # Subtotal limpio
+        if "subtotal" in df.columns:
+            df["subtotal"] = df["subtotal"].apply(clean_amount)
+
+        # Mapeo estandarizado de DataMapper
+        mapped = self.mapper.map_facturas(df)
 
         ok(f"Facturas extraídas y mapeadas → {len(mapped)} registros.")
         return mapped

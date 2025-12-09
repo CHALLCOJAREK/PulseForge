@@ -1,100 +1,154 @@
 # src/extractors/bank_extractor.py
 from __future__ import annotations
 
+# -------------------------
+# Bootstrap interno
+# -------------------------
 import sys
-import sqlite3
 from pathlib import Path
-import pandas as pd
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+# -------------------------
+# Imports principales
+# -------------------------
+import pandas as pd
 from src.core.logger import info, ok, warn, error
-from src.core.env_loader import get_env
-from src.transformers.data_mapper import DataMapper
+from src.core.env_loader import get_config
+from src.core.db import SourceDB
+from src.core.utils import clean_amount, normalize_text
 
 
+# ============================================================
+#   EXTRACTOR UNIVERSAL DE MOVIMIENTOS BANCARIOS
+#   - Soporta 1 tabla única o múltiples tablas
+#   - Columnas dinámicas detectadas desde settings.json
+#   - No usa DataMapper (transformación mínima)
+# ============================================================
 class BankExtractor:
-    """
-    Extrae movimientos bancarios desde DataPulse en base a las tablas
-    configuradas en settings.json → 'tablas_bancos'.
-
-    Devuelve list[dict] listos para insertar en movimientos_pf.
-    """
 
     def __init__(self):
         info("Inicializando BankExtractor…")
-        self.mapper = DataMapper()
 
-        self.tablas_bancos = self.mapper.settings.get("tablas_bancos", {})
-        if not self.tablas_bancos:
-            error("settings.json no contiene 'tablas_bancos'")
-            raise KeyError("Falta tablas_bancos en configuración.")
+        cfg = get_config()
 
-        ok(f"Tablas detectadas: {self.tablas_bancos}")
+        # conexión a BD origen (DataPulse)
+        self._db = SourceDB()
 
-    # ---------------------------------------------------------
-    def _connect(self):
-        """Conexión a la BD origen DataPulse."""
-        db_path = get_env("PULSEFORGE_SOURCE_DB", required=True)
+        # tabla única (opcional)
+        self.tabla_unica = cfg.tabla_movimientos_unica
 
-        if not Path(db_path).exists():
-            error(f"No existe BD origen: {db_path}")
-            raise FileNotFoundError("BD origen no encontrada.")
+        # múltiples tablas de bancos
+        self.tablas_bancos = cfg.bancos
 
-        return sqlite3.connect(db_path)
+        # columnas dinámicas desde settings.json
+        self.cols_bank = cfg.columnas_bancos  
 
-    # ---------------------------------------------------------
-    def _load_raw(self, tabla_real: str, cod: str) -> pd.DataFrame:
-        """Lee tabla cruda."""
-        conn = self._connect()
+        if not self.tabla_unica and not self.tablas_bancos:
+            error("No hay configuración bancaria en settings.json")
+            raise KeyError("Config bancos no encontrada.")
 
+        ok(f"Config bancos cargada → única={self.tabla_unica}, múltiples={self.tablas_bancos}")
+
+
+    # --------------------------------------------------------
+    #   DETECTOR UNIVERSAL DE COLUMNAS
+    # --------------------------------------------------------
+    @staticmethod
+    def _pick(df: pd.DataFrame, posibles: list[str]) -> str | None:
+        posibles = [p.lower() for p in posibles]
+
+        for col in df.columns:
+            col_low = col.lower()
+            if any(tag in col_low for tag in posibles):
+                return col
+        return None
+
+
+    # --------------------------------------------------------
+    #   LECTURA DE TABLA ORIGEN
+    # --------------------------------------------------------
+    def _read_table(self, table_name: str) -> pd.DataFrame:
         try:
-            query = f'SELECT * FROM "{tabla_real}"'
-            df = pd.read_sql_query(query, conn)
+            self._db.connect()
+            df = pd.read_sql_query(f'SELECT * FROM "{table_name}"', self._db.connection)
 
             if df.empty:
-                warn(f"[{cod}] Tabla vacía.")
+                warn(f"Tabla de banco vacía → {table_name}")
+
             return df
 
         except Exception as e:
-            error(f"Error leyendo banco {cod}: {e}")
-            raise
+            warn(f"No se pudo leer tabla {table_name}: {e}")
+            return pd.DataFrame()
 
         finally:
-            conn.close()
+            self._db.close()
 
-    # ---------------------------------------------------------
-    def extract(self) -> list[dict]:
-        """
-        Extrae → normaliza → mapea → devuelve movimientos bancarios list[dict].
-        """
 
-        movimientos_finales = []
+    # --------------------------------------------------------
+    #   PROCESAR Y NORMALIZAR UNA TABLA
+    # --------------------------------------------------------
+    def _process_table(self, df_raw: pd.DataFrame, codigo_banco: str) -> pd.DataFrame:
+        df = pd.DataFrame()
 
-        for cod, tabla_real in self.tablas_bancos.items():
+        # detectar cada columna requerida
+        for campo, opciones in self.cols_bank.items():
+            col = self._pick(df_raw, opciones)
 
-            df_raw = self._load_raw(tabla_real, cod)
+            if not col:
+                warn(f"[{codigo_banco}] Columna no encontrada → {campo}")
+                df[campo] = None
+                continue
+
+            df[campo] = df_raw[col]
+
+        # normalizar monto
+        if "monto" in df.columns:
+            df["monto"] = df["monto"].apply(clean_amount)
+
+        # normalizar textos
+        for campo in ["descripcion", "tipo_mov", "destinatario", "tipo_documento"]:
+            if campo in df.columns:
+                df[campo] = df[campo].astype(str).apply(normalize_text)
+
+        df["banco_codigo"] = codigo_banco
+
+        ok(f"[{codigo_banco}] Movimientos normalizados: {len(df)}")
+        return df
+
+
+    # --------------------------------------------------------
+    #   MÉTODO PRINCIPAL DE EXTRACCIÓN
+    # --------------------------------------------------------
+    def extract(self) -> pd.DataFrame:
+        movimientos = []
+
+        # --- PRIORIDAD: TABLA ÚNICA ---
+        if self.tabla_unica:
+            df_raw = self._read_table(self.tabla_unica)
+
+            if not df_raw.empty:
+                df_norm = self._process_table(df_raw, "GENERAL")
+                movimientos.append(df_norm)
+
+            return pd.concat(movimientos, ignore_index=True) if movimientos else pd.DataFrame()
+
+        # --- TABLAS MULTIPLES ---
+        for codigo, tabla in self.tablas_bancos.items():
+            df_raw = self._read_table(tabla)
             if df_raw.empty:
                 continue
 
-            # --------------------------------------------
-            # Mapeo profesional usando DataMapper
-            # --------------------------------------------
-            mapped_rows = self.mapper.map_bancos(df_raw, tabla_real)
+            df_norm = self._process_table(df_raw, codigo)
+            movimientos.append(df_norm)
 
-            # Agregar banco_codigo a cada fila
-            for m in mapped_rows:
-                m["banco_codigo"] = cod
+        if not movimientos:
+            warn("No se encontraron movimientos bancarios en ninguna tabla.")
+            return pd.DataFrame()
 
-            movimientos_finales.extend(mapped_rows)
-
-            ok(f"{len(mapped_rows)} movimientos procesados para banco {cod}")
-
-        if not movimientos_finales:
-            warn("No se encontraron movimientos bancarios.")
-            return []
-
-        ok(f"TOTAL movimientos bancarios normalizados: {len(movimientos_finales)}")
-        return movimientos_finales
+        df_final = pd.concat(movimientos, ignore_index=True)
+        ok(f"TOTAL movimientos extraídos: {len(df_final)}")
+        return df_final
+    

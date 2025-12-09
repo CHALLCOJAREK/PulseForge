@@ -17,7 +17,6 @@
  ┣ 📜 constants.json
  ┣ 📜 settings.json
 📂 data
- ┣ 📜 pulseforge.sqlite
  ┃ 📂 exports
  ┃ 📂 logs
  ┃ 📂 temp
@@ -33,6 +32,7 @@
  ┃  ┣ 📜 db.py
  ┃  ┣ 📜 env_loader.py
  ┃  ┣ 📜 logger.py
+ ┃  ┣ 📜 test_core.py
  ┃  ┣ 📜 utils.py
  ┃  ┣ 📜 validations.py
  ┃  ┃ 📂 __pycache__
@@ -45,7 +45,7 @@
  ┃  ┣ 📜 bank_extractor.py
  ┃  ┣ 📜 clients_extractor.py
  ┃  ┣ 📜 invoices_extractor.py
- ┃  ┣ 📜 test_facturas.py
+ ┃  ┣ 📜 test_extractors.py
  ┃  ┃ 📂 __pycache__
  ┃  ┃  ┣ 📜 bank_extractor.cpython-311.pyc
  ┃  ┃  ┣ 📜 clients_extractor.cpython-311.pyc
@@ -56,12 +56,15 @@
  ┃  ┣ 📜 invoice_writer.py
  ┃  ┣ 📜 match_writer.py
  ┃  ┣ 📜 newdb_builder.py
+ ┃  ┣ 📜 raw_writer.py
+ ┃  ┣ 📜 test_raw_loader.py
  ┃  ┃ 📂 __pycache__
  ┃  ┃  ┣ 📜 bank_writer.cpython-311.pyc
  ┃  ┃  ┣ 📜 clients_writer.cpython-311.pyc
  ┃  ┃  ┣ 📜 invoice_writer.cpython-311.pyc
  ┃  ┃  ┣ 📜 match_writer.cpython-311.pyc
  ┃  ┃  ┣ 📜 newdb_builder.cpython-311.pyc
+ ┃  ┃  ┣ 📜 raw_writer.cpython-311.pyc
  ┃ 📂 matchers
  ┃  ┣ 📜 matcher_engine.py
  ┃  ┃ 📂 __pycache__
@@ -81,6 +84,7 @@
  ┃  ┣ 📜 calculator.py
  ┃  ┣ 📜 data_mapper.py
  ┃  ┣ 📜 matcher.py
+ ┃  ┣ 📜 test_transformers.py
  ┃  ┃ 📂 __pycache__
  ┃  ┃  ┣ 📜 ai_helpers.cpython-311.pyc
  ┃  ┃  ┣ 📜 calculator.cpython-311.pyc

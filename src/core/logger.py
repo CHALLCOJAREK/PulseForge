@@ -7,12 +7,9 @@ from datetime import datetime
 from pathlib import Path
 import threading
 
-
-# ============================================================
-#   PULSEFORGE LOG ENGINE — CORPORATE EDITION
-# ============================================================
-
-# --- Colores consola ---
+# -------------------------
+# Paleta de colores consola
+# -------------------------
 class Colors:
     BLUE = "\033[94m"
     GREEN = "\033[92m"
@@ -22,83 +19,78 @@ class Colors:
     RESET = "\033[0m"
 
 
-# --- Carpeta logs ---
+# -------------------------
+# Configuración de archivos
+# -------------------------
 LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "pulseforge.log"
 
-_log_lock = threading.Lock()
+_lock = threading.Lock()
 
 
-# ============================================================
-#   FUNCIONES INTERNAS
-# ============================================================
+# -------------------------
+# Utilidades internas
+# -------------------------
 def _timestamp() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _write_file(level: str, message: str):
-    with _log_lock:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{_timestamp()}] [{level}] {message}\n")
+def _write(level: str, msg: str):
+    with _lock:
+        try:
+            with LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(f"[{_timestamp()}] [{level}] {msg}\n")
+        except Exception:
+            pass
 
 
-def _format_console(color: str, prefix: str, message: str) -> str:
-    return f"{color}{prefix}{Colors.RESET} {message}"
+def _console(color: str, tag: str, msg: str) -> str:
+    return f"{color}{tag}{Colors.RESET} {msg}"
 
 
-# ============================================================
-#   LOGS TRADICIONALES
-# ============================================================
+# -------------------------
+# Loggers principales
+# -------------------------
 def info(msg: str):
-    print(_format_console(Colors.BLUE, "🔵 INFO", msg))
-    _write_file("INFO", msg)
+    print(_console(Colors.BLUE, "🔵 INFO", msg))
+    _write("INFO", msg)
 
 
 def ok(msg: str):
-    print(_format_console(Colors.GREEN, "🟢 OK", msg))
-    _write_file("OK", msg)
+    print(_console(Colors.GREEN, "🟢 OK", msg))
+    _write("OK", msg)
 
 
 def warn(msg: str):
-    print(_format_console(Colors.YELLOW, "🟡 WARN", msg))
-    _write_file("WARN", msg)
+    print(_console(Colors.YELLOW, "🟡 WARN", msg))
+    _write("WARN", msg)
 
 
 def error(msg: str):
-    print(_format_console(Colors.RED, "🔴 ERROR", msg), file=sys.stderr)
-    _write_file("ERROR", msg)
+    print(_console(Colors.RED, "🔴 ERROR", msg), file=sys.stderr)
+    _write("ERROR", msg)
 
 
-# ============================================================
-#   SISTEMA DE BARRA DE PROGRESO (MATCHING, ETL, ETC)
-# ============================================================
-
-_last_progress = ""
-
+# -------------------------
+# Barras de progreso
+# -------------------------
 def start_progress(total: int, label: str = "PROCESO"):
-    """Inicia una barra de progreso"""
-    global _last_progress
-    _last_progress = ""
-    print(f"{Colors.CYAN}[{label}] Iniciando…{Colors.RESET}")
+    print(f"{Colors.CYAN}[{label}] Iniciando...{Colors.RESET}")
 
 
 def update_progress(current: int, total: int, label: str = "PROCESO"):
-    """Actualiza una barra de progreso dinámica en una sola línea"""
     if total == 0:
         return
 
-    percent = int((current / total) * 100)
-    filled = int(percent / 5)  # cada bloque es 5%
-    bar = "█" * filled + "░" * (20 - filled)
+    pct = int((current / total) * 100)
+    blk = pct // 5
+    bar = "█" * blk + "░" * (20 - blk)
 
-    line = f"{Colors.CYAN}[{label}] {bar}  {percent}%  ({current}/{total}){Colors.RESET}"
-
-    # sobrescribe la línea anterior
+    line = f"{Colors.CYAN}[{label}] {bar} {pct}% ({current}/{total}){Colors.RESET}"
     sys.stdout.write("\r" + line)
     sys.stdout.flush()
 
 
 def finish_progress(total: int, label: str = "PROCESO"):
-    """Marca el final de la barra"""
-    print(f"\r{Colors.GREEN}[{label}] COMPLETADO  ✔ ({total} items){Colors.RESET}\n")
+    print(f"\r{Colors.GREEN}[{label}] COMPLETADO ✔ ({total} items){Colors.RESET}\n")

@@ -1,206 +1,219 @@
 # src/core/env_loader.py
 from __future__ import annotations
-
-# --- BOOTSTRAP PARA QUE FUNCIONE DESDE CUALQUIER RUTA ---
 import sys
 from pathlib import Path
+import os
+import json
+from dataclasses import dataclass, field
+from typing import Any, Optional, Dict
 
+# ---------------------------------------------------------
+# Bootstrap interno
+# ---------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
+
 # ---------------------------------------------------------
-
-import os
-from dataclasses import dataclass
-from typing import Any, Optional
-
-# ---------------------------
-#  LOGGING CORPORATIVO REAL
-# ---------------------------
+# Logging corporativo
+# ---------------------------------------------------------
 from src.core.logger import info, ok, warn, error
 
 
-# ---------------------------
-#  ERRORES ESPECÍFICOS DE ENV
-# ---------------------------
+# ---------------------------------------------------------
+# Excepciones
+# ---------------------------------------------------------
 class EnvConfigError(Exception):
     pass
 
 
 _ENV_LOADED = False
+_JSON_CACHE: Dict[str, Dict[str, Any]] = {}
+_CONFIG_CACHE = None
 
 
-# ---------------------------
-#  CARGA DEL ARCHIVO .env
-# ---------------------------
-def _load_env_file(dotenv_path: Optional[Path] = None) -> None:
+# ---------------------------------------------------------
+# Lectura de JSONs seguros
+# ---------------------------------------------------------
+def _load_json(path: Path, name: str) -> Dict[str, Any]:
+    if not path.exists():
+        warn(f"{name} no encontrado → {path}")
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+            ok(f"{name} cargado.")
+            return data
+    except Exception as e:
+        error(f"Error leyendo {name}: {e}")
+        return {}
+
+
+# ---------------------------------------------------------
+# Cargar archivo .env
+# ---------------------------------------------------------
+def _load_env_file(path: Optional[Path] = None):
     global _ENV_LOADED
     if _ENV_LOADED:
         return
 
-    if dotenv_path is None:
-        dotenv_path = Path(__file__).resolve().parents[2] / ".env"
+    path = path or (ROOT / ".env")
 
-    if not dotenv_path.is_file():
-        warn(f"No se encontró archivo .env en: {dotenv_path}")
+    if not path.exists():
+        warn(f".env no encontrado → {path}")
         _ENV_LOADED = True
         return
 
     try:
-        with dotenv_path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+                if not line or "=" not in line or line.startswith("#"):
                     continue
-
                 key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-                os.environ.setdefault(key, value)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
-        ok(f".env cargado correctamente desde: {dotenv_path}")
+        ok(".env cargado.")
     except Exception as e:
         error(f"Error cargando .env: {e}")
-        raise EnvConfigError(f"Error cargando .env: {e}")
+        raise EnvConfigError(e)
 
     _ENV_LOADED = True
 
 
-# ---------------------------
-#  CASTEOS Y VALIDACIONES
-# ---------------------------
-def _cast_bool(value: str) -> bool:
-    return value.strip().lower() in ("1", "true", "t", "yes", "y", "on")
-
-
-def _cast_value(raw: str, t: type) -> Any:
-    if t is bool:
-        return _cast_bool(raw)
-    if t is int:
-        return int(raw)
-    if t is float:
-        return float(raw.replace(",", "."))
-    return raw
-
-
-# ---------------------------
-#  LECTOR PRINCIPAL GET_ENV
-# ---------------------------
-def get_env(
-    key: str,
-    *,
-    required: bool = False,
-    default: Any = None,
-    cast_type: type = str,
-) -> Any:
-
-    _load_env_file()
-    raw = os.environ.get(key)
-
-    if raw is None or raw == "":
-        if required:
-            error(f"Variable requerida faltante: {key}")
-            raise EnvConfigError(f"Variable requerida faltante: {key}")
-        warn(f"Variable opcional no encontrada: {key}, usando default: {default}")
-        return default
-
+# ---------------------------------------------------------
+# Casting universal
+# ---------------------------------------------------------
+def _cast(raw: Any, t: type) -> Any:
+    if raw is None:
+        return None
     try:
-        return _cast_value(raw, cast_type)
-    except Exception as e:
-        error(f"Error casteando {key}='{raw}' → {cast_type.__name__}")
-        raise EnvConfigError(f"Error casteando {key}: {e}")
+        if t is bool:
+            return str(raw).lower() in ("1", "true", "yes", "y", "on")
+        if t is int:
+            return int(raw)
+        if t is float:
+            return float(str(raw).replace(",", "."))
+        return raw
+    except Exception:
+        warn(f"No se pudo castear '{raw}' como {t.__name__}")
+        return raw
 
 
-# ---------------------------
-#  MODELO CENTRAL DE CONFIG
-# ---------------------------
+# ---------------------------------------------------------
+# Resolución jerárquica
+#         env → settings.json → constants.json
+# ---------------------------------------------------------
+def _get(key: str, default: Any = None):
+    return (
+        os.environ.get(key)
+        or _JSON_CACHE.get("settings", {}).get(key)
+        or _JSON_CACHE.get("constants", {}).get(key)
+        or default
+    )
+
+
+def get_config_value(key: str, *, cast: type = str, default: Any = None):
+    raw = _get(key, default)
+    return _cast(raw, cast)
+
+
+# ---------------------------------------------------------
+# MODELO PRINCIPAL DE CONFIGURACIÓN
+# ---------------------------------------------------------
 @dataclass
 class PulseForgeConfig:
 
-    # BASES DE DATOS
-    db_type: str
-    db_source_path: str         # <-- DataPulse
-    db_path: str                # <-- PulseForge actual
-    newdb_path: str             # <-- PulseForge destino
+    # BD config
+    db_source: str
+    db_pulseforge: str
+    db_new: str
 
-    # CONTABILIDAD
-    detraccion_porcentaje: float
+    # Reglas contables
     igv: float
-    days_tolerance_pago: int
-    monto_variacion: float
-    tipo_cambio_usd_pen: float
+    detraccion: float
+    variacion_monto: float
+    tolerancia_dias: int
+    tipo_cambio: float
 
-    # BANCOS
-    cuenta_empresa: Optional[str]
-    cuenta_detraccion: Optional[str]
+    # Config dinámico
+    tablas: Dict[str, Any] = field(default_factory=dict)
+    bancos: Dict[str, Any] = field(default_factory=dict)
+    tabla_movimientos_unica: Optional[str] = None
 
-    # IA
-    activar_ia: bool
-    api_gemini_key: Optional[str]
+    # Columnas del settings.json
+    columnas_facturas: Dict[str, Any] = field(default_factory=dict)
+    columnas_bancos: Dict[str, Any] = field(default_factory=dict)
 
-    # OTROS
-    modo_debug: bool
+    # IA y Modo debug
+    activar_ia: bool = False
+    gemini_key: Optional[str] = None
+    modo_debug: bool = False
 
 
-_CONFIG_CACHE: Optional[PulseForgeConfig] = None
-
-
-# ---------------------------
-#  CARGA PRINCIPAL DE CONFIG
-# ---------------------------
+# ---------------------------------------------------------
+# CARGA PRINCIPAL
+# ---------------------------------------------------------
 def load_pulseforge_config(force_reload: bool = False) -> PulseForgeConfig:
-    global _CONFIG_CACHE
+    global _CONFIG_CACHE, _JSON_CACHE
+
     if _CONFIG_CACHE is not None and not force_reload:
         return _CONFIG_CACHE
 
-    info("Cargando configuración de PulseForge…")
+    info("Cargando configuración universal...")
 
-    db_type = get_env("PULSEFORGE_DB_TYPE", required=True).lower()
-    if db_type not in ("sqlite", "postgres", "mysql"):
-        raise EnvConfigError(f"PULSEFORGE_DB_TYPE inválido: {db_type}")
+    _load_env_file()
+
+    _JSON_CACHE["settings"] = _load_json(ROOT / "config" / "settings.json", "settings.json")
+    _JSON_CACHE["constants"] = _load_json(ROOT / "config" / "constants.json", "constants.json")
+
+    # --- Tablas principales (si falta alguna NO revienta)
+    tablas_raw = _JSON_CACHE["settings"].get("tablas", {})
+    tablas = {k: v for k, v in tablas_raw.items() if isinstance(v, str) and v.strip()}
+
+    # --- Tabla única de movimientos (opcional)
+    tabla_unica = _JSON_CACHE["settings"].get("tabla_movimientos_unica", None)
+    if tabla_unica is not None and not isinstance(tabla_unica, str):
+        tabla_unica = None
+
+    # --- Tablas de bancos (puede haber 0, 1 o muchas)
+    bancos_raw = _JSON_CACHE["settings"].get("tablas_bancos", {})
+    bancos = {
+        alias: tabla
+        for alias, tabla in bancos_raw.items()
+        if isinstance(tabla, str) and tabla.strip()
+    }
 
     cfg = PulseForgeConfig(
+        db_source=get_config_value("PULSEFORGE_SOURCE_DB", cast=str),
+        db_pulseforge=get_config_value("PULSEFORGE_DB_PATH", cast=str),
+        db_new=get_config_value("PULSEFORGE_NEWDB_PATH", cast=str),
 
-        # BASES DE DATOS
-        db_type=db_type,
-        db_source_path=get_env("PULSEFORGE_SOURCE_DB", required=True),
-        db_path=get_env("PULSEFORGE_DB_PATH", required=True),
-        newdb_path=get_env("PULSEFORGE_NEWDB_PATH", required=True),
+        # Reglas
+        igv=get_config_value("IGV", cast=float),
+        detraccion=get_config_value("DETRACCION_PORCENTAJE", cast=float),
+        variacion_monto=get_config_value("MONTO_VARIACION", cast=float, default=1.0),
+        tolerancia_dias=get_config_value("DAYS_TOLERANCE_PAGO", cast=int, default=3),
+        tipo_cambio=get_config_value("TIPO_CAMBIO_USD_PEN", cast=float, default=3.80),
 
-        # CONTABILIDAD
-        detraccion_porcentaje=get_env("DETRACCION_PORCENTAJE", required=True, cast_type=float),
-        igv=get_env("IGV", required=True, cast_type=float),
-        days_tolerance_pago=get_env("DAYS_TOLERANCE_PAGO", required=True, cast_type=int),
-        monto_variacion=get_env("MONTO_VARIACION", required=True, cast_type=float),
-        tipo_cambio_usd_pen=get_env("TIPO_CAMBIO_USD_PEN", default=3.80, cast_type=float),
+        # Config dinámico
+        tablas=tablas,
+        bancos=bancos,
+        tabla_movimientos_unica=tabla_unica,
 
-        # BANCOS
-        cuenta_empresa=get_env("CUENTA_EMPRESA", default="") or None,
-        cuenta_detraccion=get_env("CUENTA_DETRACCION", default="") or None,
+        # Columnas del settings.json
+        columnas_facturas=_JSON_CACHE["settings"].get("columnas_facturas", {}),
+        columnas_bancos=_JSON_CACHE["settings"].get("columnas_bancos", {}),
 
-        # IA
-        activar_ia=get_env("ACTIVAR_IA", default=True, cast_type=bool),
-        api_gemini_key=get_env("API_GEMINI_KEY", default="") or None,
-
-        # OTROS
-        modo_debug=get_env("MODO_DEBUG", default=False, cast_type=bool),
+        activar_ia=get_config_value("ACTIVAR_IA", cast=bool, default=False),
+        gemini_key=get_config_value("API_GEMINI_KEY", cast=str, default=None),
+        modo_debug=get_config_value("MODO_DEBUG", cast=bool, default=False),
     )
 
-    ok("Configuración cargada correctamente.")
+    ok("Configuración universal cargada.")
     _CONFIG_CACHE = cfg
     return cfg
 
 
 def get_config() -> PulseForgeConfig:
     return load_pulseforge_config()
-
-
-# ---------------------------
-#  TEST INTERNO
-# ---------------------------
-if __name__ == "__main__":
-    cfg = load_pulseforge_config(force_reload=True)
-
-    info("===== CONFIGURACIÓN CARGADA =====")
-    for field, value in cfg.__dict__.items():
-        print(f"{field}: {value}")
