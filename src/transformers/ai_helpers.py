@@ -27,6 +27,7 @@ from src.core.env_loader import get_config, EnvConfigError
 # ============================================================
 _CFG = None
 _IA_ENABLED = False
+_IA_PROVIDER = None
 _GEMINI_MODELS: List[str] = []
 
 _MODELOS_PROBADOS = set()
@@ -85,29 +86,46 @@ def _local_sim(a: str, b: str) -> float:
 
 
 # ============================================================
-# INICIALIZACIÓN GEMINI
+# INICIALIZACIÓN GENERAL IA
 # ============================================================
-def _init_gemini() -> None:
-    global _CFG, _IA_ENABLED, _GEMINI_MODELS
+def _init_ia():
+    """
+    Inicializa la IA según el provider en settings.json.
+    Solo soporta GEMINI (porque así lo pidió Jarek).
+    No usa fallback a OpenAI ni Claude.
+    """
+    global _CFG, _IA_ENABLED, _IA_PROVIDER, _GEMINI_MODELS
 
     if _CFG is not None:
-        return
+        return  # ya inicializado
 
     try:
         _CFG = get_config()
     except EnvConfigError:
-        warn("AIHelpers: No config IA → AI OFF")
+        warn("AIHelpers: no hay configuración válida → IA OFF")
         _IA_ENABLED = False
         return
 
-    if not getattr(_CFG, "activar_ia", False):
-        warn("AI OFF por configuración (ACTIVAR_IA=false)")
+    _IA_PROVIDER = getattr(_CFG, "ia_provider", "gemini").lower()
+    activar_ia = getattr(_CFG, "activar_ia", False)
+
+    if not activar_ia:
+        warn("AI OFF por configuración (activar_ia = false)")
+        _IA_ENABLED = False
+        return
+
+    # =====================================================
+    # SOLO GEMINI (lo que solicitaste)
+    # =====================================================
+    if _IA_PROVIDER != "gemini":
+        error(f"Provider IA no soportado: '{_IA_PROVIDER}'. Solo se permite 'gemini'.")
         _IA_ENABLED = False
         return
 
     api_key = getattr(_CFG, "gemini_key", None)
+
     if not api_key:
-        warn("AIHelpers: Sin API Key → AI OFF")
+        warn("AIHelpers: No hay GEMINI_API_KEY en .env → IA OFF")
         _IA_ENABLED = False
         return
 
@@ -115,35 +133,27 @@ def _init_gemini() -> None:
         genai.configure(api_key=api_key)
         _IA_ENABLED = True
     except Exception as e:
-        error(f"AI OFF — Error configurando Gemini: {e}")
+        error(f"IA OFF — Error configurando Gemini: {e}")
         _IA_ENABLED = False
         return
 
-    # Modelo principal + fallbacks
-    primary = "models/gemini-2.0-flash"
+    # Modelos usados (tu arquitectura original)
     _GEMINI_MODELS = [
-        primary,
+        "models/gemini-2.0-flash",
         "models/gemini-1.5-flash",
         "models/gemini-flash-latest",
         "models/gemini-pro",
     ]
 
-    info("IA inicializada correctamente → models/gemini-2.0-flash")
+    info("IA (Gemini) inicializada correctamente.")
 
 
 # ============================================================
-# LLAMADA A IA — ROBUSTA, CON TIMEOUT + RETRIES
+# LLAMADA A IA GEMINI (ÚNICO PROVIDER)
 # ============================================================
-def _call_gemini(prompt: str, timeout: int = 10, retries: int = 2) -> Optional[str]:
-    """
-    Llamada a IA reforzada:
-      - Timeout de 10s por modelo
-      - 2 reintentos automáticos
-      - Limpieza de respuesta
-      - Fallback seguro
-    """
+def _call_gemini(prompt: str, timeout: int = 10, retries: int = 1) -> Optional[str]:
+    _init_ia()
 
-    _init_gemini()
     if not _IA_ENABLED:
         return None
 
@@ -157,19 +167,19 @@ def _call_gemini(prompt: str, timeout: int = 10, retries: int = 2) -> Optional[s
             try:
                 start = time.time()
                 model = genai.GenerativeModel(model_name)
-
                 resp = model.generate_content(
                     prompt,
                     safety_settings={"HARASSMENT": "BLOCK_NONE"}
                 )
-
                 elapsed = time.time() - start
 
+                # Timeout artificial
                 if elapsed > timeout:
-                    warn(f"IA timeout ({elapsed:.2f}s) → reintentando…")
+                    warn(f"IA timeout ({elapsed:.2f}s) → intentando siguiente modelo…")
                     break
 
                 text = getattr(resp, "text", None)
+
                 if not text and getattr(resp, "candidates", None):
                     parts = resp.candidates[0].content.parts
                     text = "".join((getattr(p, "text", "") or "") for p in parts)
@@ -186,11 +196,7 @@ def _call_gemini(prompt: str, timeout: int = 10, retries: int = 2) -> Optional[s
             except Exception as e:
                 warn(f"IA modelo falló ({model_name}) → {e}")
 
-        if intento < retries:
-            warn(f"IA → Reintentando llamada ({intento + 1}/{retries})…")
-            time.sleep(0.3)
-
-    error("IA → Fallaron todos los intentos. Activando fallback.")
+    error("AIHelpers: todos los modelos fallaron.")
     return None
 
 
@@ -213,8 +219,8 @@ Texto 2: "{b_norm}"
 """
 
     text = _call_gemini(prompt)
-
     score = _extract_number(text) if text else None
+
     if score is None:
         score = _local_sim(a_norm, b_norm)
 
@@ -224,7 +230,7 @@ Texto 2: "{b_norm}"
 
 
 # ============================================================
-# CLASIFICACIÓN IA
+# CLASIFICACIÓN DE MOVIMIENTO
 # ============================================================
 def ai_classify(description: str) -> Dict[str, Any]:
     desc_norm = normalize_text(description or "")
@@ -250,7 +256,7 @@ Descripción: "{desc_norm}"
     result = {
         "tipo": "otro",
         "probabilidad": 0.3,
-        "justificacion": "Fallback IA",
+        "justificacion": "Sin respuesta IA",
     }
 
     try:
@@ -259,8 +265,9 @@ Descripción: "{desc_norm}"
             data = json.loads(m.group(0))
             result["tipo"] = data.get("tipo", "otro")
             result["probabilidad"] = float(data.get("probabilidad", 0.3))
-            result["justificacion"] = (data.get("justificacion") or "").strip() or "Sin detalle IA"
-    except:
+            result["justificacion"] = (data.get("justificacion") or "").strip()
+
+    except Exception:
         pass
 
     _CLASSIFY_CACHE[desc_norm] = result
@@ -268,7 +275,7 @@ Descripción: "{desc_norm}"
 
 
 # ============================================================
-# DECISIÓN MATCH IA
+# DECISIÓN FINAL IA DE MATCH
 # ============================================================
 def ai_decide_match(payload: Dict[str, Any]) -> Dict[str, Any]:
     key_json = json.dumps(payload, sort_keys=True, ensure_ascii=False)
@@ -293,7 +300,7 @@ Datos:
 
     result = {
         "decision": "MATCH_DUDOSO",
-        "justificacion": "Fallback IA",
+        "justificacion": "Sin respuesta IA",
     }
 
     try:
@@ -301,8 +308,9 @@ Datos:
         if m:
             data = json.loads(m.group(0))
             result["decision"] = data.get("decision", "MATCH_DUDOSO")
-            result["justificacion"] = (data.get("justificacion") or "").strip() or "Sin detalle IA"
-    except:
+            result["justificacion"] = (data.get("justificacion") or "").strip()
+
+    except Exception:
         pass
 
     _DECIDE_CACHE[key_json] = result

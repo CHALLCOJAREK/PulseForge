@@ -10,9 +10,9 @@ from typing import Any, Optional, Dict
 # ------------------------------------------------------------
 # Bootstrap rutas
 # ------------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[2]     # C:/Proyectos/PulseForge
-CONFIG_DIR = ROOT / "config"                   # settings.json & constants.json
-ENV_FILE = ROOT / ".env"                       # Archivo .env en raíz del proyecto
+ROOT = Path(__file__).resolve().parents[2]
+CONFIG_DIR = ROOT / "config"
+ENV_FILE = ROOT / ".env"
 
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -24,14 +24,14 @@ from src.core.logger import info, ok, warn, error
 
 
 # ============================================================
-#  EXCEPCIÓN
+# EXCEPCIÓN
 # ============================================================
 class EnvConfigError(Exception):
     pass
 
 
 # ============================================================
-#  CARGAR .ENV MANUALMENTE
+# CARGA .ENV
 # ============================================================
 def _load_env():
     if not ENV_FILE.exists():
@@ -44,25 +44,24 @@ def _load_env():
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-
                 if "=" not in line:
                     continue
 
                 key, value = line.split("=", 1)
                 os.environ[key.strip()] = value.strip()
+
     except Exception as e:
         error(f"Error cargando .env: {e}")
 
 
 # ============================================================
-#  CACHES
+# CACHE
 # ============================================================
-_JSON_CACHE: Dict[str, Dict[str, Any]] = {}
-_CONFIG_CACHE = None
+_CONFIG_CACHE: Optional["PulseForgeConfig"] = None
 
 
 # ============================================================
-#  LECTOR JSON SEGURO
+# JSON seguro
 # ============================================================
 def _load_json(filename: str) -> Dict[str, Any]:
     path = CONFIG_DIR / filename
@@ -74,13 +73,14 @@ def _load_json(filename: str) -> Dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as f:
             return json.load(f)
+
     except Exception as e:
         error(f"Error leyendo {filename}: {e}")
         return {}
 
 
 # ============================================================
-#  MODELOS DE CONFIGURACIÓN
+# MODELOS
 # ============================================================
 @dataclass
 class ParametrosContables:
@@ -107,10 +107,10 @@ class PulseForgeConfig:
     db_destino: str = ""
     db_new: str = ""
 
-    # Param contables
+    # Parámetros contables
     parametros: ParametrosContables = field(default_factory=ParametrosContables)
 
-    # Bancos / DataTables
+    # DataTables
     tablas: Dict[str, str] = field(default_factory=dict)
     tablas_bancos: Dict[str, str] = field(default_factory=dict)
     tabla_movimientos_unica: str = ""
@@ -119,32 +119,40 @@ class PulseForgeConfig:
     columnas_bancos: Dict[str, list] = field(default_factory=dict)
     columnas_facturas: Dict[str, list] = field(default_factory=dict)
 
-    # Cuentas empresa
+    # Cuentas
     cuentas_empresa: list = field(default_factory=list)
     cuenta_detraccion: str = ""
 
+    # IA
+    activar_ia: bool = False
+    ia_provider: str = "gemini"
+
+    # Keys IA dinámicas
+    gemini_key: Optional[str] = None
+    openai_key: Optional[str] = None
+    claude_key: Optional[str] = None
+
 
 # ============================================================
-#  CARGA PRINCIPAL DE CONFIGURACIÓN
+# CARGA PRINCIPAL
 # ============================================================
 def get_config() -> PulseForgeConfig:
     global _CONFIG_CACHE
     if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
 
-    info("Cargando configuración PulseForge 2025...")
+    info("Cargando configuración PulseForge 2025…")
 
-    # Cargar .env ANTES DE LEER os.getenv()
+    # Cargar .env primero
     _load_env()
 
     settings = _load_json("settings.json")
     constants = _load_json("constants.json")
 
     # -----------------------------
-    # Extraer parámetros contables
+    # PARAMETROS CONTABLES
     # -----------------------------
     parametros_raw = settings.get("parametros_contables", {})
-
     pc = ParametrosContables(
         detraccion=parametros_raw.get("detraccion", 0.0),
         igv=parametros_raw.get("igv", 0.0),
@@ -153,14 +161,8 @@ def get_config() -> PulseForgeConfig:
         tipo_cambio_usd_pen=parametros_raw.get("tipo_cambio_usd_pen", 0.0),
     )
 
-    if pc.igv <= 0 or pc.igv > 0.5:
-        raise EnvConfigError(f"IGV fuera de rango permitido → {pc.igv}")
-
-    if pc.detraccion < 0 or pc.detraccion > 1:
-        raise EnvConfigError(f"Detracción fuera de rango → {pc.detraccion}")
-
     # -----------------------------
-    # Rutas DB desde .env
+    # RUTAS DB
     # -----------------------------
     db_source = os.getenv("PULSEFORGE_SOURCE_DB", "").strip()
     db_destino = os.getenv("PULSEFORGE_DB_PATH", "").strip()
@@ -170,47 +172,59 @@ def get_config() -> PulseForgeConfig:
         raise EnvConfigError("DB ORIGEN no existe → ruta vacía en .env")
 
     # -----------------------------
-    # Construcción final de config
+    # IA CONFIG
+    # -----------------------------
+    ia_cfg = settings.get("features", {})
+    activar_ia = bool(ia_cfg.get("activar_ia", False))
+    ia_provider = ia_cfg.get("ia_provider", "gemini")
+
+    # -----------------------------
+    # CREACIÓN CONFIG
     # -----------------------------
     cfg = PulseForgeConfig(
-    env=settings.get("app", {}).get("env", "development"),
-    run_mode=settings.get("app", {}).get("run_mode", "incremental"),
+        env=settings.get("app", {}).get("env", "development"),
+        run_mode=settings.get("app", {}).get("run_mode", "incremental"),
 
-    data_dir=settings.get("paths", {}).get("data_dir", "./data"),
-    logs_dir=settings.get("paths", {}).get("logs_dir", "./logs"),
-    exports_dir=settings.get("paths", {}).get("exports_dir", "./data/exports"),
-    temp_dir=settings.get("paths", {}).get("temp_dir", "./data/temp"),
+        data_dir=settings.get("paths", {}).get("data_dir", "./data"),
+        logs_dir=settings.get("paths", {}).get("logs_dir", "./logs"),
+        exports_dir=settings.get("paths", {}).get("exports_dir", "./data/exports"),
+        temp_dir=settings.get("paths", {}).get("temp_dir", "./data/temp"),
 
-    db_source=db_source,
-    db_destino=db_destino,
-    db_new=db_new,
+        db_source=db_source,
+        db_destino=db_destino,
+        db_new=db_new,
 
-    parametros=pc,
+        parametros=pc,
 
-    tablas=settings.get("tablas", {}),
-    tablas_bancos=settings.get("tablas_bancos", {}),
-    tabla_movimientos_unica=settings.get("tabla_movimientos_unica", ""),
+        tablas=settings.get("tablas", {}),
+        tablas_bancos=settings.get("tablas_bancos", {}),
+        tabla_movimientos_unica=settings.get("tabla_movimientos_unica", ""),
 
-    columnas_bancos=settings.get("columnas_bancos", {}),
-    columnas_facturas=settings.get("columnas_facturas", {}),
+        columnas_bancos=settings.get("columnas_bancos", {}),
+        columnas_facturas=settings.get("columnas_facturas", {}),
 
-    cuentas_empresa=settings.get("cuentas_bancarias", {}).get("cuentas_empresa", []),
-    cuenta_detraccion=settings.get("cuentas_bancarias", {}).get("cuenta_detraccion", ""),
-    )   
+        cuentas_empresa=settings.get("cuentas_bancarias", {}).get("cuentas_empresa", []),
+        cuenta_detraccion=settings.get("cuentas_bancarias", {}).get("cuenta_detraccion", ""),
 
-    # 👉 ALIAS PROFESIONAL PARA EL TEST
+        activar_ia=activar_ia,
+        ia_provider=ia_provider,
+
+        # IA keys desde .env
+        gemini_key=os.getenv("API_GEMINI_KEY"),
+        openai_key=os.getenv("OPENAI_API_KEY"),
+        claude_key=os.getenv("CLAUDE_API_KEY"),
+    )
+
+    # Alias estándar
     cfg.db_pulseforge = cfg.db_destino
-    cfg.igv = cfg.parametros.igv
-    cfg.detraccion = cfg.parametros.detraccion
-    cfg.tipo_cambio = cfg.parametros.tipo_cambio_usd_pen
-
 
     _CONFIG_CACHE = cfg
     ok("Configuración cargada correctamente.")
     return cfg
 
+
 # ============================================================
-#  GET ENV
+# GET_ENV WRAPPER
 # ============================================================
 def get_env(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(key, default)

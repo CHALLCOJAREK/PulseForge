@@ -102,6 +102,20 @@ class PipelineMatcher:
         ok(f"Matches generados: {len(df_match)}")
         ok(f"Detalles generados: {len(df_detalles)}")
 
+        # ==========================================================
+        # 🔍 DEBUG: INSPECCIÓN DE MATCHES
+        # ==========================================================
+        print("\n===== DEBUG MATCHER COLUMNS =====")
+        print(df_match.columns.tolist())
+
+        print("\n===== DEBUG MATCHER SAMPLE =====")
+        print(df_match.head(15))
+
+        if len(df_match) > 0:
+            print("\n===== DEBUG MATCHER RAW ROW =====")
+            print(df_match.iloc[0].to_dict())
+        # ==========================================================
+
         # ----------------------------------------------------
         # GUARDAR MATCHES REALES → BD
         # ----------------------------------------------------

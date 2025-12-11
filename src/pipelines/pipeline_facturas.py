@@ -1,4 +1,4 @@
-#  src/pipelines/pipeline_facturas.py
+# src/pipelines/pipeline_facturas.py
 from __future__ import annotations
 import sys
 import sqlite3
@@ -54,10 +54,13 @@ class PipelineFacturas:
             return pd.DataFrame()
 
     # --------------------------------------------------------
-    # PROCESO PRINCIPAL
+    # PROCESO PRINCIPAL (NORMALIZAR + CALCULAR)
     # --------------------------------------------------------
     def process(self) -> pd.DataFrame:
-        """Aplica Calculator a todas las facturas ya cargadas."""
+        """
+        Aplica Calculator a todas las facturas ya cargadas
+        y guarda inmediatamente los cálculos en la BD destino.
+        """
         df = self.load_facturas()
         if df.empty:
             warn("PipelineFacturas: No hay data que procesar.")
@@ -65,12 +68,21 @@ class PipelineFacturas:
 
         info("Aplicando Calculator sobre facturas…")
         df_calc = self.calc.process_facturas(df)
-        ok("Facturas procesadas correctamente.")
 
+        # ====================================================
+        # NUEVO: Guardar cálculos en calculos_pf
+        # ====================================================
+        try:
+            self.calc.save_calculos(df_calc)
+            ok("Cálculos financieros persistidos correctamente.")
+        except Exception as e:
+            error(f"Error guardando cálculos financieros: {e}")
+
+        ok("Facturas procesadas correctamente.")
         return df_calc
 
     # --------------------------------------------------------
-    # GUARDADO (solo si deseas persistir cálculos)
+    # GUARDADO OPCIONAL EN TABLA AUXILIAR (no se usa en FULL)
     # --------------------------------------------------------
     def save(self, df: pd.DataFrame, table_name: str = "facturas_pf_calc"):
         """Guarda los cálculos en una tabla opcional."""

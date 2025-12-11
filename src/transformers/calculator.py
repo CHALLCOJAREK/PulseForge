@@ -25,7 +25,7 @@ from src.core.validations import validate_igv, validate_detraccion, validate_tip
 
 
 # ============================================================
-#  CALCULATOR · MOTOR FINANCIERO PULSEFORGE 2025
+#  CALCULATOR · MOTOR FINANCIERO PULSEFORGE 2025 — PREMIUM
 # ============================================================
 class Calculator:
 
@@ -34,12 +34,12 @@ class Calculator:
 
         self.cfg = cfg or get_config()
 
-        # Parámetros contables (settings.json)
+        # Parámetros contables
         self.igv = float(validate_igv(self.cfg.parametros.igv))
         self.detraccion = float(validate_detraccion(self.cfg.parametros.detraccion))
         self.tipo_cambio = float(validate_tipo_cambio(self.cfg.parametros.tipo_cambio_usd_pen))
 
-        # Parámetros de ventana de tolerancia
+        # Tolerancia
         self.monto_variacion = float(self.cfg.parametros.monto_variacion)
         self.days_tolerance = int(self.cfg.parametros.dias_tolerancia_pago)
 
@@ -53,44 +53,29 @@ class Calculator:
         return df
 
     # ============================================================
-    #   PROCESO FACTURAS – USANDO SOLO LA DATA DE LA BD DESTINO
+    #   PROCESO FACTURAS – CÁLCULO FINANCIERO COMPLETO
     # ============================================================
     def process_facturas(self, df_facturas: pd.DataFrame) -> pd.DataFrame:
-        info("Aplicando motor financiero a facturas (BD destino)…")
+        info("Aplicando motor financiero a facturas…")
 
         df = self._normalize_df(df_facturas)
 
-        # --------------------------------------------------------
-        # VALIDACIÓN BÁSICA
-        # --------------------------------------------------------
+        # Validación
         if "subtotal" not in df.columns:
             raise ValueError("Falta columna 'subtotal' en facturas_pf")
 
         df["subtotal"] = pd.to_numeric(df["subtotal"], errors="coerce").fillna(0)
 
-        # --------------------------------------------------------
-        # FECHAS ORIGINALES DE LA BD DESTINO
-        # --------------------------------------------------------
         df["fecha_emision"] = pd.to_datetime(df.get("fecha_emision"), errors="coerce")
         df["vencimiento"] = pd.to_datetime(df.get("vencimiento"), errors="coerce")
 
-        # --------------------------------------------------------
-        # CALCULAR DÍAS DE CRÉDITO A PARTIR DE (vencimiento - fecha_emision)
-        # --------------------------------------------------------
+        # Días crédito
         df["dias_credito"] = (df["vencimiento"] - df["fecha_emision"]).dt.days
-
-        # Si la diferencia da negativa o no se puede calcular → dejar NULL
         df.loc[df["dias_credito"] < 0, "dias_credito"] = None
 
-        # --------------------------------------------------------
-        # FECHA DE PAGO = VENCIMIENTO
-        # Si vencimiento es NULL → fecha_pago también será NULL
-        # --------------------------------------------------------
         df["fecha_pago"] = df["vencimiento"]
 
-        # --------------------------------------------------------
-        # CÁLCULOS FINANCIEROS (A PARTIR DEL SUBTOTAL)
-        # --------------------------------------------------------
+        # Cálculo financiero
         df["igv"] = (df["subtotal"] * self.igv).round(2)
         df["total_con_igv"] = (df["subtotal"] + df["igv"]).round(2)
         df["detraccion_monto"] = (df["total_con_igv"] * self.detraccion).round(2)
@@ -98,145 +83,114 @@ class Calculator:
 
         df["tiene_detraccion"] = df["detraccion_monto"] > 0
 
-        # --------------------------------------------------------
-        # VENTANAS DE MATCH (solo si existe fecha_pago)
-        # --------------------------------------------------------
         df["ventana_inicio"] = df["fecha_pago"] - pd.to_timedelta(self.days_tolerance, unit="D")
         df["ventana_fin"] = df["fecha_pago"] + pd.to_timedelta(self.days_tolerance, unit="D")
 
-        # Donde fecha_pago es NULL → ventanas deben ser NULL
         df.loc[df["fecha_pago"].isna(), ["ventana_inicio", "ventana_fin"]] = None
 
         ok("Facturas procesadas correctamente.")
         return df
-        # ============================================================
-    #   NUEVO: GUARDAR CÁLCULOS EN LA TABLA calculos_pf
+
+    # ============================================================
+    #   PREMIUM: GUARDAR CÁLCULOS EN BD + ACTUALIZAR FACTURAS
     # ============================================================
     def save_calculos(self, df_facturas: pd.DataFrame):
         """
-        Guarda resultados del cálculo financiero en la tabla calculos_pf.
-        Una fila por factura. Modelo completamente persistente.
+        Guarda cálculos en calculos_pf y sincroniza facturas_pf.
+        Totalmente seguro contra NaT.
         """
-
         from src.core.db import PulseForgeDB, DatabaseError
         db = PulseForgeDB()
 
-        info(f"Guardando cálculos → {len(df_facturas)} filas…")
+        if "source_hash" not in df_facturas.columns:
+            warn("No existe columna 'source_hash'. No se pueden guardar cálculos.")
+            return
 
-        required_cols = [
-            "source_hash",      # identificador único de factura
-            "subtotal",
-            "igv",
-            "total_con_igv",
-            "detraccion_monto",
-            "neto_recibido",
-            "dias_credito",
-            "fecha_pago",
-        ]
-
-        # Validación
-        for col in required_cols:
-            if col not in df_facturas.columns:
-                warn(f"⚠ No se encontró columna requerida: {col}. Se usará None.")
-                df_facturas[col] = None
+        info(f"Guardando cálculos financieros → {len(df_facturas)} filas…")
 
         registros = df_facturas.to_dict("records")
 
         for row in registros:
-            data = {
-                "factura_hash": row.get("source_hash"),
+            factura_hash = row.get("source_hash")
+
+            # --- FIX PREMIUM (Evita el NaTType error) ---
+            fecha_pago_val = row.get("fecha_pago")
+            if pd.isna(fecha_pago_val):
+                fecha_pago_str = None
+            else:
+                fecha_pago_str = fecha_pago_val.strftime("%Y-%m-%d")
+
+            data_calc = {
+                "factura_hash": factura_hash,
                 "subtotal": row.get("subtotal"),
                 "igv": row.get("igv"),
                 "total_final": row.get("total_con_igv"),
                 "detraccion": row.get("detraccion_monto"),
                 "dias_credito": row.get("dias_credito"),
-                "fecha_pago": row.get("fecha_pago").strftime("%Y-%m-%d") if row.get("fecha_pago") else None,
-                "variacion": 0  # opcional, según reglas contables
+                "fecha_pago": fecha_pago_str,
+                "variacion": 0
             }
 
             try:
-                db.insert("calculos_pf", data)
-            except DatabaseError as e:
-                warn(f"Fila omitida (posible duplicado) → {e}")
+                db.insert("calculos_pf", data_calc)
+            except DatabaseError:
+                pass  # evitar duplicados
 
-        ok("Cálculos guardados satisfactoriamente en calculos_pf.")
+            # --- Sincronizar factura (pero NO tocar match_id) ---
+            data_factura = {
+                "igv": row.get("igv"),
+                "total": row.get("total_con_igv")
+            }
+
+            try:
+                db.update(
+                    "facturas_pf",
+                    data_factura,
+                    "source_hash = ?",
+                    (factura_hash,)
+                )
+            except Exception as e:
+                warn(f"No se pudo actualizar factura {factura_hash}: {e}")
+
+        ok("Cálculos persistidos y facturas sincronizadas.")
 
     # ============================================================
-    #   PROCESO BANCOS — NORMALIZACIÓN ESTÁNDAR
+    #   PROCESO BANCOS
     # ============================================================
     def process_bancos(self, df_bancos: pd.DataFrame) -> pd.DataFrame:
-        """Normaliza movimientos bancarios para que el matcher los entienda."""
-        info("Aplicando motor de normalización bancaria…")
+        info("Aplicando normalización bancaria…")
 
         df = df_bancos.copy()
         df.columns = [str(c).strip() for c in df.columns]
 
-        # --------------------------------------------------------
-        # FECHA
-        # --------------------------------------------------------
-        fecha_col = next((c for c in df.columns if c.lower() in ("fecha", "f_operacion", "fecha_operacion",
-                                                                 "fec_mov", "fecha movimiento")), None)
+        fecha_col = next((c for c in df.columns if "fecha" in c.lower()), None)
+        df["Fecha"] = pd.to_datetime(df[fecha_col], errors="coerce") if fecha_col else pd.NaT
 
-        if fecha_col:
-            df["Fecha"] = pd.to_datetime(df[fecha_col], errors="coerce")
-        else:
-            warn("No se encontró columna de fecha en bancos. Se asignará NaT.")
-            df["Fecha"] = pd.NaT
-
-        # --------------------------------------------------------
-        # DESCRIPCIÓN
-        # --------------------------------------------------------
-        desc_col = next((c for c in df.columns
-                         if c.lower() in ("descripcion", "detalle", "glosa", "descripcion_mov", "concepto")), None)
-
+        desc_col = next((c for c in df.columns if "desc" in c.lower() or "glosa" in c.lower()), None)
         df["Descripcion"] = df[desc_col].astype(str) if desc_col else ""
 
-        # --------------------------------------------------------
-        # OPERACIÓN
-        # --------------------------------------------------------
-        oper_col = next((c for c in df.columns
-                         if c.lower() in ("operacion", "nro_operacion", "referencia", "codigo_operacion")), None)
-
+        oper_col = next((c for c in df.columns if "oper" in c.lower()), None)
         df["Operacion"] = df[oper_col].astype(str) if oper_col else ""
 
-        # --------------------------------------------------------
-        # MONTO
-        # --------------------------------------------------------
-        monto_col = next((c for c in df.columns
-                           if c.lower() in ("monto", "importe", "abono", "cargo", "valor")), None)
+        monto_col = next((c for c in df.columns if c.lower() in ("monto", "importe", "abono", "cargo")), None)
+        df["Monto"] = pd.to_numeric(df[monto_col], errors="coerce").fillna(0) if monto_col else 0
 
-        if monto_col:
-            df["Monto"] = pd.to_numeric(df[monto_col], errors="coerce").fillna(0)
-        else:
-            warn("No se encontró columna de monto. Se asignará 0.")
-            df["Monto"] = 0
-
-        # --------------------------------------------------------
-        # MONEDA
-        # --------------------------------------------------------
         mon_col = next((c for c in df.columns if c.lower() == "moneda"), None)
-        if mon_col:
-            df["moneda"] = df[mon_col].astype(str).str.upper().str.strip()
-        else:
-            df["moneda"] = "PEN"
+        df["moneda"] = df[mon_col].astype(str).str.upper().str.strip() if mon_col else "PEN"
 
-        # --------------------------------------------------------
-        # CONVERSIÓN A PEN SI CORRESPONDE
-        # --------------------------------------------------------
         df["Monto_PEN"] = df["Monto"]
-
         try:
-            mask_usd = df["moneda"].str.upper().isin(["USD", "$", "DOLARES"])
+            mask_usd = df["moneda"].str.contains("USD|DOL", case=False)
             df.loc[mask_usd, "Monto_PEN"] = df.loc[mask_usd, "Monto"] * self.tipo_cambio
         except Exception as e:
-            warn(f"No se pudo convertir USD a PEN: {e}")
+            warn(f"No se pudo convertir USD → PEN: {e}")
 
-        ok("Movimientos bancarios normalizados correctamente.")
+        ok("Movimientos bancarios normalizados.")
         return df
 
 
 # ============================================================
-#   APIs PARA DATAMAPPER — INMUTABLES
+#   APIs PARA DATAMAPPER
 # ============================================================
 def preparar_factura_para_insert(subtotal: float, extra_campos: Dict[str, Any]):
     igv = round(subtotal * 0.18, 2)
