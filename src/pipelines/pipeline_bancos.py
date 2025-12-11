@@ -1,67 +1,102 @@
-# src/pipelines/pipeline_bancos.py
+#  src/pipelines/pipeline_bancos.py
 from __future__ import annotations
-
-# ============================================================
-#  PULSEFORGE · PIPELINE BANCOS (COMPATIBLE CON list[dict])
-# ============================================================
 import sys
+import sqlite3
 from pathlib import Path
+import pandas as pd
 
+# ------------------------------------------------------------
+# Bootstrap rutas
+# ------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+# ------------------------------------------------------------
+# Imports corporativos
+# ------------------------------------------------------------
 from src.core.logger import info, ok, warn, error
-from src.extractors.bank_extractor import BankExtractor
-from src.loaders.bank_writer import BankWriter
+from src.core.env_loader import get_config
+from src.transformers.calculator import Calculator
 
 
+# ============================================================
+#   PIPELINE BANCOS — NORMALIZACIÓN ÚNICA ESTÁNDAR 2025
+# ============================================================
 class PipelineBancos:
 
-    def __init__(self) -> None:
+    def __init__(self):
         info("Inicializando PipelineBancos…")
-        self.extractor = BankExtractor()
-        self.writer = BankWriter()
-        ok("PipelineBancos inicializado correctamente.")
+
+        self.cfg = get_config()
+        self.db_path = self.cfg.db_pulseforge
+        self.calc = Calculator()
+
+        ok(f"PipelineBancos listo. BD destino → {self.db_path}")
 
     # --------------------------------------------------------
-    def run(self, reset: bool = False) -> int:
-        """
-        Flujo completo:
-        1) Extraer (BankExtractor → list[dict])
-        2) Insertar (BankWriter → movimientos_pf)
-        """
+    # LECTURA DIRECTA DESDE BD DESTINO
+    # --------------------------------------------------------
+    def load_bancos(self) -> pd.DataFrame:
+        """Carga movimientos desde bancos_pf."""
         try:
-            info("🔎 Extrayendo movimientos de todos los bancos…")
-            movimientos = self.extractor.extract()  # <-- LIST[DICT]
+            conn = sqlite3.connect(self.db_path)
 
-            if not movimientos:
-                warn("No hay movimientos bancarios para procesar.")
-                return 0
+            df = pd.read_sql_query("""
+                SELECT * FROM bancos_pf;
+            """, conn)
 
-            ok(f"Total movimientos extraídos: {len(movimientos)}")
+            conn.close()
 
-            info("💾 Insertando movimientos en PulseForge…")
-            inserted = self.writer.save_bancos(movimientos, reset=reset)
+            if df.empty:
+                warn("No se encontraron movimientos en bancos_pf.")
+            else:
+                ok(f"Movimientos cargados: {len(df)}")
 
-            ok(f"Pipeline de bancos completado. Registros insertados: {inserted}")
-            return inserted
+            return df
 
         except Exception as e:
-            error(f"Error en PipelineBancos: {e}")
-            raise
+            error(f"Error cargando bancos_pf: {e}")
+            return pd.DataFrame()
+
+    # --------------------------------------------------------
+    # PROCESO PRINCIPAL
+    # --------------------------------------------------------
+    def process(self) -> pd.DataFrame:
+        """Aplica proceso de normalización bancaria."""
+        df = self.load_bancos()
+
+        if df.empty:
+            warn("PipelineBancos: No hay data para procesar.")
+            return df
+
+        info("Normalizando movimientos bancarios…")
+        df_out = self.calc.process_bancos(df)
+
+        ok("Movimientos bancarios procesados correctamente.")
+        return df_out
+
+    # --------------------------------------------------------
+    # GUARDADO (opcional)
+    # --------------------------------------------------------
+    def save(self, df: pd.DataFrame, table_name: str = "bancos_pf_norm"):
+        """Guarda la versión normalizada."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            df.to_sql(table_name, conn, if_exists="replace", index=False)
+            conn.close()
+            ok(f"Movimientos guardados en tabla: {table_name}")
+        except Exception as e:
+            error(f"Error guardando movimientos bancarios: {e}")
 
 
 # ============================================================
-# TEST LOCAL
+# EJECUCIÓN DIRECTA
 # ============================================================
 if __name__ == "__main__":
-    try:
-        info("⚙️ Test local de PipelineBancos…")
-        pipeline = PipelineBancos()
-        inserted = pipeline.run(reset=True)
-        ok(f"Test finalizado. Registros insertados: {inserted}")
+    pb = PipelineBancos()
+    df_out = pb.process()
 
-    except Exception as e:
-        error(f"Fallo en test de PipelineBancos: {e}")
-    
+    if df_out is not None and not df_out.empty:
+        info("Vista previa del resultado:")
+        print(df_out.head())

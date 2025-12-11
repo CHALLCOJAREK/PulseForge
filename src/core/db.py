@@ -199,3 +199,26 @@ class NewDB(BaseDB):
         cfg = get_config()
         super().__init__(cfg.db_new)
         info(f"BD Nueva configurada: {cfg.db_new}")
+
+# =====================================================
+# API COMPATIBLE — get_connection() para Pipelines/Matcher
+# =====================================================
+def get_connection():
+    """
+    Compatibilidad corporativa:
+    Retorna una conexión SQLite usando la BD destino PulseForge.
+    No reemplaza clases existentes. No altera la arquitectura.
+    """
+    try:
+        cfg = get_config()
+        db_path = cfg.db_destino or cfg.db_new
+
+        if not db_path:
+            raise DatabaseError("Ruta de BD destino no configurada.")
+
+        db = PulseForgeDB()   # Usa tu clase existente
+        return db.connect()
+
+    except Exception as e:
+        error(f"get_connection() → Error: {e}")
+        raise

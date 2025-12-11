@@ -12,119 +12,110 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+# ------------------------------------------------------------
+# Imports corporativos
+# ------------------------------------------------------------
 from src.core.logger import info, ok, warn, error
-from src.core.env_loader import get_env
+from src.core.env_loader import get_config
+from src.core.db import PulseForgeDB
 from src.loaders.newdb_builder import NewDBBuilder
 
-# EXTRACTORS
-from src.extractors.invoices_extractor import InvoicesExtractor
-from src.extractors.bank_extractor import BankExtractor
-from src.extractors.clients_extractor import ClientsExtractor
+# PIPELINES
+from src.pipelines.pipeline_facturas import PipelineFacturas
+from src.pipelines.pipeline_bancos import PipelineBancos
+from src.pipelines.pipeline_clients import PipelineClientes
+from src.pipelines.pipeline_matcher import PipelineMatcher
 
-# LOADERS
-from src.loaders.invoice_writer import InvoiceWriter
-from src.loaders.bank_writer import BankWriter
-from src.loaders.clients_writer import ClientsWriter
+# WRITER MATCH
 from src.loaders.match_writer import MatchWriter
 
-# MATCHER ENGINE
-from src.matchers.matcher_engine import MatcherEngine
-
-# DB WRAPPER
-from src.core.db import PulseForgeDB
-
 
 # ============================================================
-#  PULSEFORGE MAIN ORCHESTRATOR
+#  MOTOR PRINCIPAL DE PULSEFORGE
 # ============================================================
 def main(full_reset: bool = False):
-    info("=== 🚀 INICIANDO PULSEFORGE ===")
+    info("=== 🚀 INICIANDO PULSEFORGE (MAIN ENGINE) ===")
+
+    cfg = get_config()
+    db_path = cfg.db_destino
 
     # ========================================================
-    # 0. CREACIÓN / RESET DE BASE DE DATOS
+    # 0. CREACIÓN O RESETEO DE LA BD
     # ========================================================
     if full_reset:
-        warn("Reseteo completo activado: recreando base de datos…")
+        warn("Reseteo completo activado: reconstruyendo pulseforge.sqlite…")
         NewDBBuilder().build(reset=True)
     else:
-        ok("La base existente será utilizada.")
+        if not Path(db_path).exists():
+            warn("BD no encontrada → generando nueva automáticamente.")
+            NewDBBuilder().build(reset=True)
+        else:
+            ok("BD destino encontrada. Se usará modo incremental.")
 
-    # Auto-crear si no existe
-    db_path = Path(get_env("PULSEFORGE_NEWDB_PATH"))
-    if not db_path.exists():
-        warn(f"La BD destino no existe → generando nueva en {db_path}")
-        NewDBBuilder().build(reset=True)
+    db = PulseForgeDB()  # apertura segura
+
+    # ========================================================
+    # 1. PIPELINE CLIENTES
+    # ========================================================
+    info("📌 PIPELINE CLIENTES — Extrayendo, mapeando y cargando…")
+    clientes_list = PipelineClientes().process()
+
+    if clientes_list:
+        ok(f"Clientes procesados: {len(clientes_list)}")
     else:
-        ok("BD destino encontrada. Modo incremental activado.")
-
-    db = PulseForgeDB()
+        warn("No se detectaron clientes nuevos.")
 
     # ========================================================
-    # 1. EXTRACTORS
+    # 2. PIPELINE FACTURAS
     # ========================================================
-    info("📥 Extrayendo CLIENTES…")
-    df_clients = ClientsExtractor().extract()
-    ok(f"Clientes extraídos: {len(df_clients)}")
+    info("📌 PIPELINE FACTURAS — Extrayendo, mapeando, calculando…")
+    df_fact = PipelineFacturas().process()
 
-    info("📥 Extrayendo FACTURAS…")
-    df_facturas = InvoicesExtractor().extract()
-    ok(f"Facturas extraídas: {len(df_facturas)}")
-
-    info("📥 Extrayendo BANCOS…")
-    df_bancos = BankExtractor().extract()
-    ok(f"Movimientos extraídos: {len(df_bancos)}")
+    if df_fact is not None and not df_fact.empty:
+        ok(f"Facturas procesadas: {len(df_fact)}")
+    else:
+        warn("No se detectaron facturas.")
 
     # ========================================================
-    # 2. LOADERS → BD
+    # 3. PIPELINE BANCOS
     # ========================================================
-    info("💾 Guardando CLIENTES…")
-    ClientsWriter().save(df_clients, reset=full_reset)
+    info("📌 PIPELINE BANCOS — Extrayendo, normalizando y cargando…")
+    df_bank = PipelineBancos().process()
 
-    info("💾 Guardando FACTURAS…")
-    InvoiceWriter().save(df_facturas, reset=full_reset)
-
-    info("💾 Guardando BANCOS…")
-    BankWriter().save(df_bancos, reset=full_reset)
-
-    ok("Datos cargados en BD correctamente.")
+    if df_bank is not None and not df_bank.empty:
+        ok(f"Movimientos bancarios procesados: {len(df_bank)}")
+    else:
+        warn("No se detectaron movimientos.")
 
     # ========================================================
-    # 3. CARGAR DESDE BD PARA MATCHING
+    # 4. MATCHER PIPELINE COMPLETO
     # ========================================================
-    info("📤 Leyendo facturas y bancos desde BD…")
+    info("🔍 Ejecutando MATCH COMPLETO…")
 
-    df_fact = db.read("SELECT * FROM facturas_pf")
-    df_mov = db.read("SELECT * FROM movimientos_pf")
+    pm = PipelineMatcher()
+    df_matches, df_detalles = pm.process()
 
-    ok(f"Facturas cargadas: {len(df_fact)}")
-    ok(f"Movimientos cargados: {len(df_mov)}")
-
-    # ========================================================
-    # 4. MATCHER ENGINE
-    # ========================================================
-    info("🔍 Ejecutando motor de Matching…")
-    engine = MatcherEngine()
-
-    df_match, df_detalles = engine.run(df_fact, df_mov)
-
-    ok(f"Resultados de match: {len(df_match)}")
+    ok(f"Matches generados: {len(df_matches)}")
     ok(f"Detalles generados: {len(df_detalles)}")
 
     # ========================================================
-    # 5. GUARDAR RESULTADOS
+    # 5. GUARDAR RESULTADOS DEL MATCH
     # ========================================================
     info("💾 Guardando resultados del MATCH…")
-    MatchWriter().save(df_match, df_detalles, reset=full_reset)
 
-    ok("Matching guardado correctamente.")
+    mw = MatchWriter()
+    mw.save(df_matches, df_detalles, reset=full_reset)
+
+    ok("Match guardado correctamente en BD destino.")
     ok("✨ PulseForge finalizado sin errores.")
 
 
 # ============================================================
-# ENTRYPOINT
+# ENTRYPOINT DIRECTO
 # ============================================================
 if __name__ == "__main__":
     try:
+        # Modo full-reset para reconstruir todo desde cero.
         main(full_reset=True)
     except Exception as e:
         error("❌ Error crítico en PulseForge:")

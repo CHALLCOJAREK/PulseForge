@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.core.logger import warn
-from src.core.env_loader import get_config
+from src.core.env_loader import get_config, get_env
 from src.transformers.ai_helpers import ai_similarity, ai_decide_match
 
 
@@ -29,15 +29,25 @@ class Matcher:
 
     def __init__(self):
         cfg = get_config()
+        self.cfg = cfg
 
-        self.var_monto = float(cfg.variacion_monto)
+        # ------------------------------------------------------
+        # Parámetros contables y de variación
+        # ------------------------------------------------------
+        # Desde settings.json → parametros_contables
+        self.var_monto = float(cfg.parametros.monto_variacion)
+        # Alias ya definido en env_loader: tipo_cambio = tipo_cambio_usd_pen
         self.tc_usd_pen = float(cfg.tipo_cambio)
+
+        # Días extras que extienden la ventana de búsqueda
         self.extra_days = 3
 
+        # Umbrales de similitud
         self.sim_strong = 0.55
         self.sim_dudoso = 0.35
 
-        self.use_ai = bool(cfg.activar_ia)
+        # Flag híbrido IA (si algún día se mapea en cfg; si no, False)
+        self.use_ai = bool(getattr(cfg, "activar_ia", False))
 
     @staticmethod
     def _similarity_basic(a: str, b: str) -> float:
@@ -299,7 +309,8 @@ class Matcher:
                         "tiene_terminos_flex": bool(flex_flag),
                     })
                     categoria = dec.get("decision", categoria)
-                    just_ia = dec.get("justificacion", "")
+                    just_ia = dec.get("justificacion", ""
+                    )
                 except:
                     pass
 

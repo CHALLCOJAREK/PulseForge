@@ -4,6 +4,7 @@
  ┣ 📜 CodeHistory.cmd
  ┣ 📜 estructura.txt
  ┣ 📜 gitpush.py
+ ┣ 📜 None
  ┣ 📜 README.md
  ┣ 📜 requirements.txt
  ┣ 📜 run_pulseforge_setup.py
@@ -26,11 +27,12 @@
 📂 logs
  ┣ 📜 pulseforge.log
 📂 src
- ┣ 📜 cli.py
  ┣ 📜 main.py
  ┣ 📜 test.py
  ┃ 📂 api
  ┃  ┣ 📜 api_server.py
+ ┃ 📂 cli
+ ┃  ┣ 📜 pulseforge.py
  ┃ 📂 core
  ┃  ┣ 📜 db.py
  ┃  ┣ 📜 env_loader.py
@@ -58,6 +60,7 @@
  ┃  ┣ 📜 bank_writer.py
  ┃  ┣ 📜 clients_writer.py
  ┃  ┣ 📜 invoice_writer.py
+ ┃  ┣ 📜 match_writer.py
  ┃  ┣ 📜 newdb_builder.py
  ┃  ┣ 📜 test_loaders.py
  ┃  ┃ 📂 __pycache__
@@ -69,6 +72,7 @@
  ┃  ┃  ┣ 📜 raw_writer.cpython-311.pyc
  ┃ 📂 matchers
  ┃  ┣ 📜 matcher_engine.py
+ ┃  ┣ 📜 test_matchers.py
  ┃  ┃ 📂 __pycache__
  ┃  ┃  ┣ 📜 matcher_engine.cpython-311.pyc
  ┃ 📂 pipelines
@@ -78,9 +82,17 @@
  ┃  ┣ 📜 pipeline_clients.py
  ┃  ┣ 📜 pipeline_facturas.py
  ┃  ┣ 📜 pipeline_matcher.py
+ ┃  ┣ 📜 test_pipelines.py
+ ┃  ┃ 📂 __pycache__
+ ┃  ┃  ┣ 📜 incremental.cpython-311.pyc
+ ┃  ┃  ┣ 📜 pipeline_bancos.cpython-311.pyc
+ ┃  ┃  ┣ 📜 pipeline_clients.cpython-311.pyc
+ ┃  ┃  ┣ 📜 pipeline_facturas.cpython-311.pyc
+ ┃  ┃  ┣ 📜 pipeline_matcher.cpython-311.pyc
  ┃ 📂 reports
  ┃  ┣ 📜 excel_reporter.py
  ┃  ┣ 📜 summary_reporter.py
+ ┃  ┣ 📜 test_reports.py
  ┃ 📂 transformers
  ┃  ┣ 📜 ai_helpers.py
  ┃  ┣ 📜 calculator.py

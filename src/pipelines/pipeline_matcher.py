@@ -1,136 +1,149 @@
 # src/pipelines/pipeline_matcher.py
 from __future__ import annotations
 
-# ============================================================
-#  PULSEFORGE · PIPELINE MATCHER (VERSIÓN CORPORATIVA)
-#  Ejecuta el motor de matching y escribe resultados en matches_pf
-# ============================================================
-
 import sys
-import sqlite3
 from pathlib import Path
 import pandas as pd
+from datetime import datetime
 
 # ------------------------------------------------------------
-#  BOOTSTRAP RUTAS
+# Bootstrap rutas
 # ------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+# ------------------------------------------------------------
+# Imports corporativos
+# ------------------------------------------------------------
 from src.core.logger import info, ok, warn, error
-from src.core.env_loader import get_env
+from src.core.env_loader import get_config
+from src.core.db import PulseForgeDB
 
-# Motor y Writer oficiales
 from src.matchers.matcher_engine import MatcherEngine
 from src.loaders.match_writer import MatchWriter
 
 
-# ------------------------------------------------------------
-#  Conexión con pulseforge.sqlite
-# ------------------------------------------------------------
-def _get_conn_pf() -> sqlite3.Connection:
-    db_path = str(get_env("PULSEFORGE_NEWDB_PATH")).strip()
-    if not db_path:
-        error("PULSEFORGE_NEWDB_PATH no configurado en .env")
-        raise ValueError("Falta PULSEFORGE_NEWDB_PATH")
-
-    file = Path(db_path)
-    if not file.exists():
-        error(f"La base pulseforge.sqlite no existe: {file}")
-        raise RuntimeError("Ejecuta primero newdb_builder.py y los demás pipelines.")
-
-    info(f"Conectando a BD PulseForge → {file}")
-    return sqlite3.connect(file)
-
-
 # ============================================================
-#  PIPELINE MATCHER — MOTOR PRINCIPAL
+#        PIPELINE MATCHER · EJECUCIÓN REAL EMPRESARIAL
 # ============================================================
 class PipelineMatcher:
 
-    def __init__(self) -> None:
+    def __init__(self):
         info("Inicializando PipelineMatcher…")
 
-        self.conn = _get_conn_pf()
+        self.cfg = get_config()
+        self.db = PulseForgeDB()
         self.writer = MatchWriter()
-        self.matcher = MatcherEngine()
+        self.engine = MatcherEngine()
 
-        ok("PipelineMatcher listo.")
-
-    # --------------------------------------------------------
-    def _load_facturas_pf(self) -> pd.DataFrame:
-        info("📄 Cargando facturas desde facturas_pf…")
-        df = pd.read_sql_query("SELECT * FROM facturas_pf", self.conn)
-
-        if df.empty:
-            warn("No existen facturas en pulseforge.sqlite.")
-        else:
-            ok(f"Facturas cargadas: {len(df)}")
-
-        return df
+        ok(f"PipelineMatcher listo. BD → {self.cfg.db_destino}")
 
     # --------------------------------------------------------
-    def _load_movimientos_pf(self) -> pd.DataFrame:
-        info("🏦 Cargando movimientos desde movimientos_pf…")
-        df = pd.read_sql_query("SELECT * FROM movimientos_pf", self.conn)
-
-        if df.empty:
-            warn("No existen movimientos bancarios en pulseforge.sqlite.")
-        else:
-            ok(f"Movimientos cargados: {len(df)}")
-
-        return df
-
+    # CARGA DE DATOS DESDE BD
     # --------------------------------------------------------
-    def run(self, reset: bool = False) -> int:
-        """
-        Ejecuta matching completo:
-        - Lee facturas + movimientos
-        - Llama al motor inteligente
-        - Inserta matches + detalles
-        """
-        info("🚀 Ejecutando PipelineMatcher…")
-
-        df_fact = self._load_facturas_pf()
-        df_mov = self._load_movimientos_pf()
-
-        if df_fact.empty or df_mov.empty:
-            error("No se puede ejecutar el matcher: faltan datos.")
-            return 0
-
-        # Ejecutar motor de matching
-        info("🤖 Ejecutando motor de Matching IA/Reglas…")
-
+    def _load_data(self):
+        """Carga facturas y bancos desde la BD PulseForge."""
         try:
-            df_matches, df_detalles = self.matcher.run(df_fact, df_mov)
+            conn = self.db.connect()
+
+            df_fact = pd.read_sql_query("SELECT * FROM facturas_pf", conn)
+            df_bank = pd.read_sql_query("SELECT * FROM bancos_pf", conn)
+
+            ok(f"Facturas cargadas: {len(df_fact)}")
+            ok(f"Movimientos cargados: {len(df_bank)}")
+
+            return df_fact, df_bank
+
         except Exception as e:
-            error(f"Error ejecutando matcher: {e}")
-            raise
+            error(f"Error cargando data desde BD: {e}")
+            return pd.DataFrame(), pd.DataFrame()
 
-        ok(f"Matches generados: {len(df_matches)}")
+    # --------------------------------------------------------
+    # AUDITORÍA OFICIAL
+    # --------------------------------------------------------
+    def _audit(self, evento: str, detalle: str):
+        try:
+            conn = self.db.connect()
+            fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            conn.execute(
+                "INSERT INTO auditoria_pf (evento, detalle, fecha) VALUES (?, ?, ?)",
+                (evento, detalle, fecha)
+            )
+            conn.commit()
+        except Exception as e:
+            warn(f"No se pudo registrar auditoría: {e}")
 
-        # Guardar en BD
-        info("💾 Guardando matches y detalles en matches_pf…")
+    # --------------------------------------------------------
+    # PROCESAMIENTO PRINCIPAL
+    # --------------------------------------------------------
+    def run(self) -> dict:
+        """
+        Ejecuta el matching completo y devuelve:
+          - df_matches
+          - df_detalles
+        Y guarda los matches reales en BD.
+        """
+        info("=== PIPELINE MATCHER · EJECUCIÓN COMPLETA ===")
 
-        inserted = self.writer.save(
-            df_match=df_matches,
-            df_detalles=df_detalles,
-            reset=reset
-        )
+        df_fact, df_bank = self._load_data()
 
-        ok(f"Pipeline de Matching completado → {inserted} registros.")
-        return inserted
+        if df_fact.empty:
+            warn("No hay facturas para procesar.")
+            return {}
+
+        if df_bank.empty:
+            warn("No hay movimientos bancarios para procesar.")
+            return {}
+
+        info("Ejecutando motor MatcherEngine…")
+        df_match, df_detalles = self.engine.run(df_fact, df_bank)
+
+        ok(f"Matches generados: {len(df_match)}")
+        ok(f"Detalles generados: {len(df_detalles)}")
+
+        # ----------------------------------------------------
+        # GUARDAR MATCHES REALES → BD
+        # ----------------------------------------------------
+        if not df_match.empty:
+            info("Guardando matches reales en BD…")
+            self.writer.save_many(df_match.to_dict("records"))
+        else:
+            warn("No se generaron matches válidos.")
+
+        # ----------------------------------------------------
+        # GUARDAR DETALLES (TABLA TEMPORAL)
+        # ----------------------------------------------------
+        if not df_detalles.empty:
+            try:
+                df_detalles.to_sql(
+                    "match_detalles_tmp",
+                    self.db.connect(),
+                    if_exists="replace",
+                    index=False
+                )
+                ok("Detalles guardados en tabla temporal match_detalles_tmp.")
+            except Exception as e:
+                warn(f"No se pudieron guardar los detalles: {e}")
+
+        # Auditoría
+        self._audit("MATCH_RUN", f"Matches generados: {len(df_match)}")
+
+        ok("=== PIPELINE MATCHER COMPLETADO ===")
+
+        return {
+            "matches": df_match,
+            "detalles": df_detalles
+        }
 
 
 # ============================================================
-#  TEST LOCAL
+# PRUEBA CONTROLADA SI SE EJECUTA DIRECTO
 # ============================================================
 if __name__ == "__main__":
-    try:
-        info("⚙️ Test local de PipelineMatcher…")
-        pipeline = PipelineMatcher()
-        inserted = pipeline.run(reset=True)
-        ok(f"Test PipelineMatcher OK → {inserted} matches insertados.")
-    except Exception as e:
-        error(f"Fallo en test de PipelineMatcher: {e}")
+    info("=== TEST LOCAL · PIPELINE MATCHER ===")
+
+    pm = PipelineMatcher()
+    result = pm.run()
+
+    ok("=== FIN TEST MATCHER ===")

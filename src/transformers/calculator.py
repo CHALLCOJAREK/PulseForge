@@ -7,19 +7,25 @@ from datetime import timedelta
 import pandas as pd
 from typing import Optional, Dict, Any
 
+# ------------------------------------------------------------
+# Bootstrap rutas
+# ------------------------------------------------------------
 CURRENT_FILE = Path(__file__).resolve()
 ROOT_DIR = CURRENT_FILE.parents[2]
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+# ------------------------------------------------------------
+# Core
+# ------------------------------------------------------------
 from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_config, PulseForgeConfig
 from src.core.validations import validate_igv, validate_detraccion, validate_tipo_cambio
 
 
 # ============================================================
-#  CALCULATOR — MOTOR FINANCIERO 2025 (VERSIÓN FINAL)
+#  CALCULATOR · MOTOR FINANCIERO PULSEFORGE 2025
 # ============================================================
 class Calculator:
 
@@ -28,16 +34,16 @@ class Calculator:
 
         self.cfg = cfg or get_config()
 
-        # Validación financiera
-        self.igv = float(validate_igv(self.cfg.igv))
-        self.detraccion = float(validate_detraccion(self.cfg.detraccion))
-        self.monto_variacion = float(self.cfg.variacion_monto)
-        self.days_tolerance = int(self.cfg.tolerancia_dias)
-        self.tipo_cambio = float(validate_tipo_cambio(self.cfg.tipo_cambio))
+        # Parámetros contables (settings.json)
+        self.igv = float(validate_igv(self.cfg.parametros.igv))
+        self.detraccion = float(validate_detraccion(self.cfg.parametros.detraccion))
+        self.tipo_cambio = float(validate_tipo_cambio(self.cfg.parametros.tipo_cambio_usd_pen))
 
-        self.modo_debug = bool(self.cfg.modo_debug)
+        # Parámetros de ventana de tolerancia
+        self.monto_variacion = float(self.cfg.parametros.monto_variacion)
+        self.days_tolerance = int(self.cfg.parametros.dias_tolerancia_pago)
 
-        ok("Calculator cargado con parámetros financieros correctos.")
+        ok("Calculator cargado con parámetros financieros oficiales.")
 
     # ------------------------------------------------------------
     @staticmethod
@@ -47,10 +53,10 @@ class Calculator:
         return df
 
     # ============================================================
-    #   PROCESO FACTURAS
+    #   PROCESO FACTURAS – USANDO SOLO LA DATA DE LA BD DESTINO
     # ============================================================
     def process_facturas(self, df_facturas: pd.DataFrame) -> pd.DataFrame:
-        info("Aplicando motor financiero a facturas…")
+        info("Aplicando motor financiero a facturas (BD destino)…")
 
         df = self._normalize_df(df_facturas)
 
@@ -58,29 +64,32 @@ class Calculator:
         # VALIDACIÓN BÁSICA
         # --------------------------------------------------------
         if "subtotal" not in df.columns:
-            raise ValueError("Falta columna 'subtotal' en facturas")
+            raise ValueError("Falta columna 'subtotal' en facturas_pf")
 
         df["subtotal"] = pd.to_numeric(df["subtotal"], errors="coerce").fillna(0)
 
         # --------------------------------------------------------
-        # FECHA EMISIÓN — SIEMPRE EXISTE
+        # FECHAS ORIGINALES DE LA BD DESTINO
         # --------------------------------------------------------
-        if "fecha_emision" not in df.columns:
-            df["fecha_emision"] = pd.NaT
-
-        df["fecha_emision"] = pd.to_datetime(df["fecha_emision"], errors="coerce")
+        df["fecha_emision"] = pd.to_datetime(df.get("fecha_emision"), errors="coerce")
+        df["vencimiento"] = pd.to_datetime(df.get("vencimiento"), errors="coerce")
 
         # --------------------------------------------------------
-        # FORMA DE PAGO + DÍAS DE PAGO — SIEMPRE EXISTE
+        # CALCULAR DÍAS DE CRÉDITO A PARTIR DE (vencimiento - fecha_emision)
         # --------------------------------------------------------
-        if "forma_pago" not in df.columns:
-            df["forma_pago"] = ""
+        df["dias_credito"] = (df["vencimiento"] - df["fecha_emision"]).dt.days
 
-        df["forma_pago"] = df["forma_pago"].fillna("")
-        df["dias_pago"] = df["forma_pago"].apply(self._parse_forma_pago)
+        # Si la diferencia da negativa o no se puede calcular → dejar NULL
+        df.loc[df["dias_credito"] < 0, "dias_credito"] = None
 
         # --------------------------------------------------------
-        # CÁLCULOS FINANCIEROS
+        # FECHA DE PAGO = VENCIMIENTO
+        # Si vencimiento es NULL → fecha_pago también será NULL
+        # --------------------------------------------------------
+        df["fecha_pago"] = df["vencimiento"]
+
+        # --------------------------------------------------------
+        # CÁLCULOS FINANCIEROS (A PARTIR DEL SUBTOTAL)
         # --------------------------------------------------------
         df["igv"] = (df["subtotal"] * self.igv).round(2)
         df["total_con_igv"] = (df["subtotal"] + df["igv"]).round(2)
@@ -90,34 +99,89 @@ class Calculator:
         df["tiene_detraccion"] = df["detraccion_monto"] > 0
 
         # --------------------------------------------------------
-        # FECHA LIMITE PAGO — SIEMPRE EXISTE
+        # VENTANAS DE MATCH (solo si existe fecha_pago)
         # --------------------------------------------------------
-        df["fecha_limite_pago"] = df["fecha_emision"] + pd.to_timedelta(df["dias_pago"], unit="D")
+        df["ventana_inicio"] = df["fecha_pago"] - pd.to_timedelta(self.days_tolerance, unit="D")
+        df["ventana_fin"] = df["fecha_pago"] + pd.to_timedelta(self.days_tolerance, unit="D")
 
-        # --------------------------------------------------------
-        # VENTANAS DE MATCH — SIEMPRE EXISTEN
-        # --------------------------------------------------------
-        df["fecha_inicio_ventana"] = df["fecha_limite_pago"] - timedelta(days=self.days_tolerance)
-        df["fecha_fin_ventana"] = df["fecha_limite_pago"] + timedelta(days=self.days_tolerance)
+        # Donde fecha_pago es NULL → ventanas deben ser NULL
+        df.loc[df["fecha_pago"].isna(), ["ventana_inicio", "ventana_fin"]] = None
 
         ok("Facturas procesadas correctamente.")
         return df
 
-    # ------------------------------------------------------------
-    @staticmethod
-    def _parse_forma_pago(value) -> int:
-        """Extrae días de crédito o retorna 0 si es contado."""
-        if value is None:
-            return 0
-        if isinstance(value, (int, float)):
-            return int(value)
+    # ============================================================
+    #   PROCESO BANCOS — NORMALIZACIÓN ESTÁNDAR
+    # ============================================================
+    def process_bancos(self, df_bancos: pd.DataFrame) -> pd.DataFrame:
+        """Normaliza movimientos bancarios para que el matcher los entienda."""
+        info("Aplicando motor de normalización bancaria…")
 
-        txt = str(value).lower()
-        if "contado" in txt:
-            return 0
+        df = df_bancos.copy()
+        df.columns = [str(c).strip() for c in df.columns]
 
-        digits = "".join(filter(str.isdigit, txt))
-        return int(digits) if digits else 0
+        # --------------------------------------------------------
+        # FECHA
+        # --------------------------------------------------------
+        fecha_col = next((c for c in df.columns if c.lower() in ("fecha", "f_operacion", "fecha_operacion",
+                                                                 "fec_mov", "fecha movimiento")), None)
+
+        if fecha_col:
+            df["Fecha"] = pd.to_datetime(df[fecha_col], errors="coerce")
+        else:
+            warn("No se encontró columna de fecha en bancos. Se asignará NaT.")
+            df["Fecha"] = pd.NaT
+
+        # --------------------------------------------------------
+        # DESCRIPCIÓN
+        # --------------------------------------------------------
+        desc_col = next((c for c in df.columns
+                         if c.lower() in ("descripcion", "detalle", "glosa", "descripcion_mov", "concepto")), None)
+
+        df["Descripcion"] = df[desc_col].astype(str) if desc_col else ""
+
+        # --------------------------------------------------------
+        # OPERACIÓN
+        # --------------------------------------------------------
+        oper_col = next((c for c in df.columns
+                         if c.lower() in ("operacion", "nro_operacion", "referencia", "codigo_operacion")), None)
+
+        df["Operacion"] = df[oper_col].astype(str) if oper_col else ""
+
+        # --------------------------------------------------------
+        # MONTO
+        # --------------------------------------------------------
+        monto_col = next((c for c in df.columns
+                           if c.lower() in ("monto", "importe", "abono", "cargo", "valor")), None)
+
+        if monto_col:
+            df["Monto"] = pd.to_numeric(df[monto_col], errors="coerce").fillna(0)
+        else:
+            warn("No se encontró columna de monto. Se asignará 0.")
+            df["Monto"] = 0
+
+        # --------------------------------------------------------
+        # MONEDA
+        # --------------------------------------------------------
+        mon_col = next((c for c in df.columns if c.lower() == "moneda"), None)
+        if mon_col:
+            df["moneda"] = df[mon_col].astype(str).str.upper().str.strip()
+        else:
+            df["moneda"] = "PEN"
+
+        # --------------------------------------------------------
+        # CONVERSIÓN A PEN SI CORRESPONDE
+        # --------------------------------------------------------
+        df["Monto_PEN"] = df["Monto"]
+
+        try:
+            mask_usd = df["moneda"].str.upper().isin(["USD", "$", "DOLARES"])
+            df.loc[mask_usd, "Monto_PEN"] = df.loc[mask_usd, "Monto"] * self.tipo_cambio
+        except Exception as e:
+            warn(f"No se pudo convertir USD a PEN: {e}")
+
+        ok("Movimientos bancarios normalizados correctamente.")
+        return df
 
 
 # ============================================================

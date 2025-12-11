@@ -1,69 +1,95 @@
-# src/pipelines/pipeline_facturas.py
+#  src/pipelines/pipeline_facturas.py
 from __future__ import annotations
-
-# ============================================================
-#  PULSEFORGE · PIPELINE FACTURAS
-#  Extract → Transform → Load para FACTURAS
-# ============================================================
 import sys
+import sqlite3
 from pathlib import Path
+import pandas as pd
 
+# ------------------------------------------------------------
 # Bootstrap rutas
+# ------------------------------------------------------------
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
+# ------------------------------------------------------------
+# Imports corporativos
+# ------------------------------------------------------------
 from src.core.logger import info, ok, warn, error
-from src.extractors.invoices_extractor import InvoicesExtractor
-from src.loaders.invoice_writer import InvoiceWriter
+from src.core.env_loader import get_config
+from src.transformers.calculator import Calculator
 
 
+# ============================================================
+#   PIPELINE FACTURAS — NORMALIZACIÓN + CÁLCULO CONTABLE
+# ============================================================
 class PipelineFacturas:
-    """
-    Pipeline empresarial para cargar facturas desde DataPulse → PulseForge.
-    - Extrae desde SQLite
-    - Normaliza y mapea (DataMapper)
-    - Calcula campos de ventana de pago (ya lo hace DataMapper + Calculator)
-    - Inserta en facturas_pf
-    """
 
     def __init__(self):
         info("Inicializando PipelineFacturas…")
-        self.extractor = InvoicesExtractor()
-        self.writer = InvoiceWriter()
-        ok("PipelineFacturas inicializado correctamente.")
+        self.cfg = get_config()
+        self.db_path = self.cfg.db_pulseforge
+        self.calc = Calculator()
+        ok(f"PipelineFacturas listo. BD destino → {self.db_path}")
 
     # --------------------------------------------------------
-    def run(self, reset: bool = False) -> int:
-        """
-        Ejecuta el pipeline completo.
-        reset=True → limpia facturas_pf antes de insertar.
-        """
+    # LECTURA DIRECTA DESDE BD DESTINO
+    # --------------------------------------------------------
+    def load_facturas(self) -> pd.DataFrame:
+        """Carga las facturas crudas desde facturas_pf."""
         try:
-            info("Iniciando extracción de facturas…")
-            df = self.extractor.get_facturas_mapeadas()
-            ok(f"Facturas extraídas y mapeadas: {len(df)}")
+            conn = sqlite3.connect(self.db_path)
+            df = pd.read_sql_query("SELECT * FROM facturas_pf;", conn)
+            conn.close()
 
-            info("Iniciando carga de facturas en PulseForge…")
-            inserted = self.writer.save_facturas(df_facturas=df, reset=reset)
-            ok(f"Pipeline de facturas completado. Registros insertados: {inserted}")
+            if df.empty:
+                warn("No se encontraron facturas en facturas_pf.")
+            else:
+                ok(f"Facturas cargadas: {len(df)}")
 
-            return inserted
+            return df
 
         except Exception as e:
-            error(f"Error en PipelineFacturas: {e}")
-            raise
+            error(f"Error cargando facturas_pf: {e}")
+            return pd.DataFrame()
+
+    # --------------------------------------------------------
+    # PROCESO PRINCIPAL
+    # --------------------------------------------------------
+    def process(self) -> pd.DataFrame:
+        """Aplica Calculator a todas las facturas ya cargadas."""
+        df = self.load_facturas()
+        if df.empty:
+            warn("PipelineFacturas: No hay data que procesar.")
+            return df
+
+        info("Aplicando Calculator sobre facturas…")
+        df_calc = self.calc.process_facturas(df)
+        ok("Facturas procesadas correctamente.")
+
+        return df_calc
+
+    # --------------------------------------------------------
+    # GUARDADO (solo si deseas persistir cálculos)
+    # --------------------------------------------------------
+    def save(self, df: pd.DataFrame, table_name: str = "facturas_pf_calc"):
+        """Guarda los cálculos en una tabla opcional."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            df.to_sql(table_name, conn, if_exists="replace", index=False)
+            conn.close()
+            ok(f"Cálculo de facturas guardado en tabla: {table_name}")
+        except Exception as e:
+            error(f"Error guardando resultados de facturas: {e}")
 
 
 # ============================================================
-# TEST LOCAL
+# EJECUCIÓN DIRECTA
 # ============================================================
 if __name__ == "__main__":
-    try:
-        info("⚙️ Test local de PipelineFacturas…")
-        pipeline = PipelineFacturas()
-        inserted = pipeline.run(reset=True)
-        ok(f"Test de PipelineFacturas finalizado. Filas insertadas: {inserted}")
+    pf = PipelineFacturas()
+    df_out = pf.process()
 
-    except Exception as e:
-        error(f"Fallo en test de PipelineFacturas: {e}")
+    if df_out is not None and not df_out.empty:
+        info("Vista previa del resultado:")
+        print(df_out.head())
