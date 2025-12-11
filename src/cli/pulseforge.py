@@ -1,4 +1,6 @@
+# src/cli/pulseforge.py
 from __future__ import annotations
+
 import sys
 import argparse
 from pathlib import Path
@@ -15,19 +17,18 @@ if str(ROOT) not in sys.path:
 # ======================================================
 from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_config
-
 from src.loaders.newdb_builder import NewDBBuilder
 
-# --------- FASE 1: EXTRACTORES + LOADERS ---------
-from src.extractors.invoices_extractor import FacturasExtractor
-from src.extractors.bank_extractor import BancosExtractor
-from src.extractors.clients_extractor import ClientesExtractor
+# ---------------- FASE 1: EXTRACTORES -----------------
+from src.extractors.invoices_extractor import InvoicesExtractor
+from src.extractors.bank_extractor import BankExtractor
+from src.extractors.clients_extractor import ClientsExtractor
 
-from src.loaders.facturas_loader import FacturasLoader
-from src.loaders.bancos_loader import BancosLoader
-from src.loaders.clientes_loader import ClientesLoader
+from src.loaders.invoice_writer import InvoiceWriter
+from src.loaders.bank_writer import BankWriter
+from src.loaders.clients_writer import ClientsWriter
 
-# --------- FASE 2: PIPELINES + MATCH ---------
+# ---------------- FASE 2: PIPELINES -------------------
 from src.pipelines.pipeline_facturas import PipelineFacturas
 from src.pipelines.pipeline_bancos import PipelineBancos
 from src.pipelines.pipeline_clients import PipelineClientes
@@ -37,87 +38,84 @@ from src.pipelines.incremental import IncrementalRunner
 
 
 # ======================================================
-#   FULL PIPELINE (F1 + F2 COMPLETO)
+#                FULL · ETL COMPLETO
 # ======================================================
 def cmd_full(args):
     info("=== FULL RUN · PULSEFORGE ===")
-    
-    # 1) Cargar entorno + settings
+
+    # 1) Configuración
     cfg = get_config()
-    ok(f"DB origen: {cfg.db_source}")
+    ok(f"DB origen:  {cfg.db_source}")
     ok(f"DB destino: {cfg.db_destino}")
 
-    # 2) Reconstruir BD destino
+    # 2) Crear BD destino / reset
     warn("Reiniciando BD destino…")
-    NewDBBuilder()   # crea tablas RAW
+    NewDBBuilder()
 
     # ==================================================
-    #   FASE 1 — EXTRACCIÓN + LOAD
+    #               FASE 1 — EXTRACCIÓN
     # ==================================================
-
     info("=== FASE 1 · EXTRACCIÓN Y CARGA ===")
 
-    # --- FACTURAS ---
-    info("Extrayendo facturas…")
-    ef = FacturasExtractor()
-    df_fact_raw = ef.extract()
+    # -------- Facturas --------
+    info("Extrayendo facturas desde BD origen…")
+    fact_ex = InvoicesExtractor()
+    facturas = fact_ex.run()  # → list[dict]
 
-    info("Cargando facturas en PulseForge…")
-    lf = FacturasLoader()
-    lf.load(df_fact_raw)
+    info("Guardando facturas RAW en PulseForge…")
+    fact_writer = InvoiceWriter()
+    fact_writer.save_many(facturas)
 
-    # --- BANCOS ---
-    info("Extrayendo bancos…")
-    eb = BancosExtractor()
-    df_bank_raw = eb.extract()
+    # -------- Bancos --------
+    info("Extrayendo movimientos bancarios…")
+    bank_ex = BankExtractor()
+    movimientos = bank_ex.run()  # list[dict]
 
-    info("Cargando bancos en PulseForge…")
-    lb = BancosLoader()
-    lb.load(df_bank_raw)
+    info("Guardando movimientos RAW en PulseForge…")
+    bank_writer = BankWriter()
+    bank_writer.save_many(movimientos)
 
-    # --- CLIENTES ---
+    # -------- Clientes --------
     info("Extrayendo clientes…")
-    ec = ClientesExtractor()
-    df_client_raw = ec.extract()
+    cli_ex = ClientsExtractor()
+    clientes = cli_ex.run()  # list[dict]
 
-    info("Cargando clientes en PulseForge…")
-    lc = ClientesLoader()
-    lc.load(df_client_raw)
+    info("Guardando clientes RAW en PulseForge…")
+    cli_writer = ClientsWriter()
+    cli_writer.save_many(clientes)
 
-    ok("FASE 1 completada ✔ (BD destino llena con RAW)")
+    ok("FASE 1 completada ✔ (BD destino llena con datos RAW)")
 
     # ==================================================
-    #   FASE 2 — PIPELINES (NORMALIZACIÓN + CÁLCULO)
+    #           FASE 2 — PIPELINES / TRANSFORMERS
     # ==================================================
-    info("=== FASE 2 · PIPELINES ===")
+    info("=== FASE 2 · PROCESAMIENTO ===")
 
-    # FACTURAS
     pf = PipelineFacturas()
-    df_facturas_proc = pf.process()
+    df_f = pf.process()
+    ok(f"Facturas procesadas: {len(df_f)}")
 
-    # BANCOS
     pb = PipelineBancos()
-    df_bancos_proc = pb.process()
+    df_b = pb.process()
+    ok(f"Movimientos procesados: {len(df_b)}")
 
-    # CLIENTES
     pc = PipelineClientes()
-    clientes_list = pc.process()
-
-    ok("Fase 2 completada ✔")
+    df_c = pc.process()
+    ok(f"Clientes procesados: {len(df_c)}")
 
     # ==================================================
-    #   MATCHING
+    #              FASE 3 — MATCH
     # ==================================================
-    info("=== FASE 3 · MATCHER ===")
+    info("=== FASE 3 · MATCHING ===")
 
     pm = PipelineMatcher()
     pm.run()
 
-    ok("FULL RUN finalizado correctamente 😎")
+    ok("FULL RUN completado con éxito 😎")
 
 
 # ======================================================
-#   INCREMENTAL
+#                INCREMENTAL
 # ======================================================
 def cmd_incremental(args):
     info("=== INCREMENTAL RUN ===")
@@ -126,48 +124,48 @@ def cmd_incremental(args):
     runner = IncrementalRunner()
     runner.run()
 
-    ok("Incremental terminado.")
+    ok("Incremental ejecutado.")
 
 
 # ======================================================
-#   SOLO MATCH
+#                SOLO MATCH
 # ======================================================
 def cmd_match(args):
     info("=== MATCH RUN ===")
-
     cfg = get_config()
-    
+
     pm = PipelineMatcher()
     pm.run()
 
-    ok("Matching actualizado.")
+    ok("Matching actualizado correctamente.")
 
 
 # ======================================================
-#   REBUILD
+#                  REBUILD
 # ======================================================
 def cmd_rebuild(args):
     info("=== REBUILD BD ===")
     cfg = get_config()
-    
+
     NewDBBuilder()
     ok("BD reconstruida.")
 
 
 # ======================================================
-#   STATUS
+#                  STATUS
 # ======================================================
 def cmd_status(args):
     cfg = get_config()
+
     info("=== ESTADO DEL SISTEMA ===")
-    ok(f"DB origen:   {cfg.db_source}")
-    ok(f"DB destino:  {cfg.db_destino}")
-    ok(f"Run Mode:    {cfg.run_mode}")
+    ok(f"DB origen:    {cfg.db_source}")
+    ok(f"DB destino:   {cfg.db_destino}")
+    ok(f"Run Mode:     {cfg.run_mode}")
     ok("PulseForge operativo ✔")
 
 
 # ======================================================
-#   REGISTRO DEL CLI
+#                   CLI SETUP
 # ======================================================
 def build_cli():
     parser = argparse.ArgumentParser(
@@ -177,10 +175,10 @@ def build_cli():
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("full", help="Ejecuta el proceso completo").set_defaults(func=cmd_full)
-    sub.add_parser("incremental", help="Incremental ETL").set_defaults(func=cmd_incremental)
+    sub.add_parser("full", help="Ejecuta ETL completo (extract + load + pipelines + match)").set_defaults(func=cmd_full)
+    sub.add_parser("incremental", help="Ejecuta incremental").set_defaults(func=cmd_incremental)
     sub.add_parser("match", help="Ejecuta solo matching").set_defaults(func=cmd_match)
-    sub.add_parser("rebuild", help="Reconstruye BD").set_defaults(func=cmd_rebuild)
+    sub.add_parser("rebuild", help="Reconstruye BD destino").set_defaults(func=cmd_rebuild)
     sub.add_parser("status", help="Estado del sistema").set_defaults(func=cmd_status)
 
     return parser

@@ -109,6 +109,57 @@ class Calculator:
 
         ok("Facturas procesadas correctamente.")
         return df
+        # ============================================================
+    #   NUEVO: GUARDAR CÁLCULOS EN LA TABLA calculos_pf
+    # ============================================================
+    def save_calculos(self, df_facturas: pd.DataFrame):
+        """
+        Guarda resultados del cálculo financiero en la tabla calculos_pf.
+        Una fila por factura. Modelo completamente persistente.
+        """
+
+        from src.core.db import PulseForgeDB, DatabaseError
+        db = PulseForgeDB()
+
+        info(f"Guardando cálculos → {len(df_facturas)} filas…")
+
+        required_cols = [
+            "source_hash",      # identificador único de factura
+            "subtotal",
+            "igv",
+            "total_con_igv",
+            "detraccion_monto",
+            "neto_recibido",
+            "dias_credito",
+            "fecha_pago",
+        ]
+
+        # Validación
+        for col in required_cols:
+            if col not in df_facturas.columns:
+                warn(f"⚠ No se encontró columna requerida: {col}. Se usará None.")
+                df_facturas[col] = None
+
+        registros = df_facturas.to_dict("records")
+
+        for row in registros:
+            data = {
+                "factura_hash": row.get("source_hash"),
+                "subtotal": row.get("subtotal"),
+                "igv": row.get("igv"),
+                "total_final": row.get("total_con_igv"),
+                "detraccion": row.get("detraccion_monto"),
+                "dias_credito": row.get("dias_credito"),
+                "fecha_pago": row.get("fecha_pago").strftime("%Y-%m-%d") if row.get("fecha_pago") else None,
+                "variacion": 0  # opcional, según reglas contables
+            }
+
+            try:
+                db.insert("calculos_pf", data)
+            except DatabaseError as e:
+                warn(f"Fila omitida (posible duplicado) → {e}")
+
+        ok("Cálculos guardados satisfactoriamente en calculos_pf.")
 
     # ============================================================
     #   PROCESO BANCOS — NORMALIZACIÓN ESTÁNDAR

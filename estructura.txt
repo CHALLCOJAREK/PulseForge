@@ -18,7 +18,6 @@
  ┣ 📜 constants.json
  ┣ 📜 settings.json
 📂 data
- ┣ 📜 pulseforge.sqlite
  ┃ 📂 exports
  ┃ 📂 logs
  ┃ 📂 temp
