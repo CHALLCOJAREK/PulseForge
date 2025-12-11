@@ -7,213 +7,210 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional, Dict
 
-# ---------------------------------------------------------
-# Bootstrap interno
-# ---------------------------------------------------------
-ROOT = Path(__file__).resolve().parents[2]
+# ------------------------------------------------------------
+# Bootstrap rutas
+# ------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[2]     # C:/Proyectos/PulseForge
+CONFIG_DIR = ROOT / "config"                   # settings.json & constants.json
+ENV_FILE = ROOT / ".env"                       # Archivo .env en raíz del proyecto
+
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-# ---------------------------------------------------------
+# ------------------------------------------------------------
 # Logging corporativo
-# ---------------------------------------------------------
+# ------------------------------------------------------------
 from src.core.logger import info, ok, warn, error
 
 
-# ---------------------------------------------------------
-# Excepciones
-# ---------------------------------------------------------
+# ============================================================
+#  EXCEPCIÓN
+# ============================================================
 class EnvConfigError(Exception):
     pass
 
 
-_ENV_LOADED = False
+# ============================================================
+#  CARGAR .ENV MANUALMENTE
+# ============================================================
+def _load_env():
+    if not ENV_FILE.exists():
+        warn(f".env no encontrado → {ENV_FILE}")
+        return
+
+    try:
+        with ENV_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                if "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                os.environ[key.strip()] = value.strip()
+    except Exception as e:
+        error(f"Error cargando .env: {e}")
+
+
+# ============================================================
+#  CACHES
+# ============================================================
 _JSON_CACHE: Dict[str, Dict[str, Any]] = {}
 _CONFIG_CACHE = None
 
 
-# ---------------------------------------------------------
-# Lectura de JSONs seguros
-# ---------------------------------------------------------
-def _load_json(path: Path, name: str) -> Dict[str, Any]:
-    if not path.exists():
-        warn(f"{name} no encontrado → {path}")
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-            ok(f"{name} cargado.")
-            return data
-    except Exception as e:
-        error(f"Error leyendo {name}: {e}")
-        return {}
-
-
-# ---------------------------------------------------------
-# Cargar archivo .env
-# ---------------------------------------------------------
-def _load_env_file(path: Optional[Path] = None):
-    global _ENV_LOADED
-    if _ENV_LOADED:
-        return
-
-    path = path or (ROOT / ".env")
+# ============================================================
+#  LECTOR JSON SEGURO
+# ============================================================
+def _load_json(filename: str) -> Dict[str, Any]:
+    path = CONFIG_DIR / filename
 
     if not path.exists():
-        warn(f".env no encontrado → {path}")
-        _ENV_LOADED = True
-        return
+        warn(f"{filename} no encontrado → {path}")
+        return {}
 
     try:
         with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or "=" not in line or line.startswith("#"):
-                    continue
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
-
-        ok(".env cargado.")
+            return json.load(f)
     except Exception as e:
-        error(f"Error cargando .env: {e}")
-        raise EnvConfigError(e)
-
-    _ENV_LOADED = True
+        error(f"Error leyendo {filename}: {e}")
+        return {}
 
 
-# ---------------------------------------------------------
-# Casting universal
-# ---------------------------------------------------------
-def _cast(raw: Any, t: type) -> Any:
-    if raw is None:
-        return None
-    try:
-        if t is bool:
-            return str(raw).lower() in ("1", "true", "yes", "y", "on")
-        if t is int:
-            return int(raw)
-        if t is float:
-            return float(str(raw).replace(",", "."))
-        return raw
-    except Exception:
-        warn(f"No se pudo castear '{raw}' como {t.__name__}")
-        return raw
+# ============================================================
+#  MODELOS DE CONFIGURACIÓN
+# ============================================================
+@dataclass
+class ParametrosContables:
+    detraccion: float = 0.0
+    igv: float = 0.0
+    dias_tolerancia_pago: int = 0
+    monto_variacion: float = 0.0
+    tipo_cambio_usd_pen: float = 0.0
 
 
-# ---------------------------------------------------------
-# Resolución jerárquica
-#         env → settings.json → constants.json
-# ---------------------------------------------------------
-def _get(key: str, default: Any = None):
-    return (
-        os.environ.get(key)
-        or _JSON_CACHE.get("settings", {}).get(key)
-        or _JSON_CACHE.get("constants", {}).get(key)
-        or default
-    )
-
-
-def get_config_value(key: str, *, cast: type = str, default: Any = None):
-    raw = _get(key, default)
-    return _cast(raw, cast)
-
-
-# ---------------------------------------------------------
-# MODELO PRINCIPAL DE CONFIGURACIÓN
-# ---------------------------------------------------------
 @dataclass
 class PulseForgeConfig:
+    env: str = "development"
+    run_mode: str = "incremental"
 
-    # BD config
-    db_source: str
-    db_pulseforge: str
-    db_new: str
+    # Paths
+    data_dir: str = "./data"
+    logs_dir: str = "./logs"
+    exports_dir: str = "./data/exports"
+    temp_dir: str = "./data/temp"
 
-    # Reglas contables
-    igv: float
-    detraccion: float
-    variacion_monto: float
-    tolerancia_dias: int
-    tipo_cambio: float
+    # DBs
+    db_source: str = ""
+    db_destino: str = ""
+    db_new: str = ""
 
-    # Config dinámico
-    tablas: Dict[str, Any] = field(default_factory=dict)
-    bancos: Dict[str, Any] = field(default_factory=dict)
-    tabla_movimientos_unica: Optional[str] = None
+    # Param contables
+    parametros: ParametrosContables = field(default_factory=ParametrosContables)
 
-    # Columnas del settings.json
-    columnas_facturas: Dict[str, Any] = field(default_factory=dict)
-    columnas_bancos: Dict[str, Any] = field(default_factory=dict)
+    # Bancos / DataTables
+    tablas: Dict[str, str] = field(default_factory=dict)
+    tablas_bancos: Dict[str, str] = field(default_factory=dict)
+    tabla_movimientos_unica: str = ""
 
-    # IA y Modo debug
-    activar_ia: bool = False
-    gemini_key: Optional[str] = None
-    modo_debug: bool = False
+    # Columnas
+    columnas_bancos: Dict[str, list] = field(default_factory=dict)
+    columnas_facturas: Dict[str, list] = field(default_factory=dict)
+
+    # Cuentas empresa
+    cuentas_empresa: list = field(default_factory=list)
+    cuenta_detraccion: str = ""
 
 
-# ---------------------------------------------------------
-# CARGA PRINCIPAL
-# ---------------------------------------------------------
-def load_pulseforge_config(force_reload: bool = False) -> PulseForgeConfig:
-    global _CONFIG_CACHE, _JSON_CACHE
-
-    if _CONFIG_CACHE is not None and not force_reload:
+# ============================================================
+#  CARGA PRINCIPAL DE CONFIGURACIÓN
+# ============================================================
+def get_config() -> PulseForgeConfig:
+    global _CONFIG_CACHE
+    if _CONFIG_CACHE is not None:
         return _CONFIG_CACHE
 
-    info("Cargando configuración universal...")
+    info("Cargando configuración PulseForge 2025...")
 
-    _load_env_file()
+    # Cargar .env ANTES DE LEER os.getenv()
+    _load_env()
 
-    _JSON_CACHE["settings"] = _load_json(ROOT / "config" / "settings.json", "settings.json")
-    _JSON_CACHE["constants"] = _load_json(ROOT / "config" / "constants.json", "constants.json")
+    settings = _load_json("settings.json")
+    constants = _load_json("constants.json")
 
-    # --- Tablas principales (si falta alguna NO revienta)
-    tablas_raw = _JSON_CACHE["settings"].get("tablas", {})
-    tablas = {k: v for k, v in tablas_raw.items() if isinstance(v, str) and v.strip()}
+    # -----------------------------
+    # Extraer parámetros contables
+    # -----------------------------
+    parametros_raw = settings.get("parametros_contables", {})
 
-    # --- Tabla única de movimientos (opcional)
-    tabla_unica = _JSON_CACHE["settings"].get("tabla_movimientos_unica", None)
-    if tabla_unica is not None and not isinstance(tabla_unica, str):
-        tabla_unica = None
-
-    # --- Tablas de bancos (puede haber 0, 1 o muchas)
-    bancos_raw = _JSON_CACHE["settings"].get("tablas_bancos", {})
-    bancos = {
-        alias: tabla
-        for alias, tabla in bancos_raw.items()
-        if isinstance(tabla, str) and tabla.strip()
-    }
-
-    cfg = PulseForgeConfig(
-        db_source=get_config_value("PULSEFORGE_SOURCE_DB", cast=str),
-        db_pulseforge=get_config_value("PULSEFORGE_DB_PATH", cast=str),
-        db_new=get_config_value("PULSEFORGE_NEWDB_PATH", cast=str),
-
-        # Reglas
-        igv=get_config_value("IGV", cast=float),
-        detraccion=get_config_value("DETRACCION_PORCENTAJE", cast=float),
-        variacion_monto=get_config_value("MONTO_VARIACION", cast=float, default=1.0),
-        tolerancia_dias=get_config_value("DAYS_TOLERANCE_PAGO", cast=int, default=3),
-        tipo_cambio=get_config_value("TIPO_CAMBIO_USD_PEN", cast=float, default=3.80),
-
-        # Config dinámico
-        tablas=tablas,
-        bancos=bancos,
-        tabla_movimientos_unica=tabla_unica,
-
-        # Columnas del settings.json
-        columnas_facturas=_JSON_CACHE["settings"].get("columnas_facturas", {}),
-        columnas_bancos=_JSON_CACHE["settings"].get("columnas_bancos", {}),
-
-        activar_ia=get_config_value("ACTIVAR_IA", cast=bool, default=False),
-        gemini_key=get_config_value("API_GEMINI_KEY", cast=str, default=None),
-        modo_debug=get_config_value("MODO_DEBUG", cast=bool, default=False),
+    pc = ParametrosContables(
+        detraccion=parametros_raw.get("detraccion", 0.0),
+        igv=parametros_raw.get("igv", 0.0),
+        dias_tolerancia_pago=parametros_raw.get("dias_tolerancia_pago", 0),
+        monto_variacion=parametros_raw.get("monto_variacion", 0.0),
+        tipo_cambio_usd_pen=parametros_raw.get("tipo_cambio_usd_pen", 0.0),
     )
 
-    ok("Configuración universal cargada.")
+    if pc.igv <= 0 or pc.igv > 0.5:
+        raise EnvConfigError(f"IGV fuera de rango permitido → {pc.igv}")
+
+    if pc.detraccion < 0 or pc.detraccion > 1:
+        raise EnvConfigError(f"Detracción fuera de rango → {pc.detraccion}")
+
+    # -----------------------------
+    # Rutas DB desde .env
+    # -----------------------------
+    db_source = os.getenv("PULSEFORGE_SOURCE_DB", "").strip()
+    db_destino = os.getenv("PULSEFORGE_DB_PATH", "").strip()
+    db_new = os.getenv("PULSEFORGE_NEWDB_PATH", "").strip()
+
+    if not db_source:
+        raise EnvConfigError("DB ORIGEN no existe → ruta vacía en .env")
+
+    # -----------------------------
+    # Construcción final de config
+    # -----------------------------
+    cfg = PulseForgeConfig(
+    env=settings.get("app", {}).get("env", "development"),
+    run_mode=settings.get("app", {}).get("run_mode", "incremental"),
+
+    data_dir=settings.get("paths", {}).get("data_dir", "./data"),
+    logs_dir=settings.get("paths", {}).get("logs_dir", "./logs"),
+    exports_dir=settings.get("paths", {}).get("exports_dir", "./data/exports"),
+    temp_dir=settings.get("paths", {}).get("temp_dir", "./data/temp"),
+
+    db_source=db_source,
+    db_destino=db_destino,
+    db_new=db_new,
+
+    parametros=pc,
+
+    tablas=settings.get("tablas", {}),
+    tablas_bancos=settings.get("tablas_bancos", {}),
+    tabla_movimientos_unica=settings.get("tabla_movimientos_unica", ""),
+
+    columnas_bancos=settings.get("columnas_bancos", {}),
+    columnas_facturas=settings.get("columnas_facturas", {}),
+
+    cuentas_empresa=settings.get("cuentas_bancarias", {}).get("cuentas_empresa", []),
+    cuenta_detraccion=settings.get("cuentas_bancarias", {}).get("cuenta_detraccion", ""),
+    )   
+
+    # 👉 ALIAS PROFESIONAL PARA EL TEST
+    cfg.db_pulseforge = cfg.db_destino
+    cfg.igv = cfg.parametros.igv
+    cfg.detraccion = cfg.parametros.detraccion
+    cfg.tipo_cambio = cfg.parametros.tipo_cambio_usd_pen
+
+
     _CONFIG_CACHE = cfg
+    ok("Configuración cargada correctamente.")
     return cfg
 
-
-def get_config() -> PulseForgeConfig:
-    return load_pulseforge_config()
+# ============================================================
+#  GET ENV
+# ============================================================
+def get_env(key: str, default: Optional[str] = None) -> Optional[str]:
+    return os.getenv(key, default)

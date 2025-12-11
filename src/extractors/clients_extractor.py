@@ -1,7 +1,9 @@
 # src/extractors/clients_extractor.py
 from __future__ import annotations
 
-# --- BOOTSTRAP RUTAS ---
+# ------------------------------------------------------------
+# Bootstrap rutas
+# ------------------------------------------------------------
 import sys
 from pathlib import Path
 
@@ -9,8 +11,13 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-# --- IMPORTS CORE ---
+# ------------------------------------------------------------
+# Imports core
+# ------------------------------------------------------------
 import pandas as pd
+from typing import List, Optional
+import hashlib
+
 from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_config
 from src.core.db import SourceDB
@@ -18,128 +25,165 @@ from src.core.utils import normalize_text, clean_ruc
 
 
 # ============================================================
-#   EXTRACTOR UNIVERSAL DE CLIENTES (SOLO LECTURA)
-#   - Lee tabla de clientes desde BD origen (DataPulse)
-#   - Aplica normalización mínima (RUC + razón social)
-#   - NO mapea al modelo final (eso es trabajo de transformers)
+#   EXTRACTOR DE CLIENTES (LIGERO / SÓLO LECTURA)
 # ============================================================
 class ClientsExtractor:
 
     def __init__(self) -> None:
-        info("Inicializando ClientsExtractor...")
+        info("Inicializando ClientsExtractor…")
 
         cfg = get_config()
-        self._cfg = cfg
-        self._tabla_clientes = cfg.tablas.get("clientes")
+        self._tabla_clientes: Optional[str] = cfg.tablas.get("clientes")
 
         if not self._tabla_clientes:
-            warn("settings.json no tiene 'clientes' en 'tablas'. El extractor devolverá DF vacío.")
-            self._tabla_clientes = None
+            warn("settings.json no define 'clientes' en 'tablas'. Extractor devolverá vacío.")
         else:
             ok(f"Tabla de clientes configurada → {self._tabla_clientes}")
 
+        # Una sola conexión viva
         self._db = SourceDB()
+        self._db.connect()
 
-    # --------------------------------------------------------
-    #   DETECCIÓN DINÁMICA DE COLUMNAS
     # --------------------------------------------------------
     @staticmethod
-    def _pick_column(df: pd.DataFrame, candidates: list[str], fallback_index: int | None = None) -> str | None:
-        """
-        Elige una columna buscando por palabras clave en el nombre.
-        Si no encuentra, usa fallback por índice (si se da).
-        """
-        cols_lower = {c.lower(): c for c in df.columns}
+    def _norm(name: str) -> str:
+        if not isinstance(name, str):
+            return ""
+        return name.strip().lower().replace(" ", "").replace("_", "")
 
-        for pattern in candidates:
-            for low, real in cols_lower.items():
-                if pattern in low:
-                    return real
+    # --------------------------------------------------------
+    # Selección inteligente de columnas
+    # --------------------------------------------------------
+    def _pick_column(self, df: pd.DataFrame, posibles: List[str]) -> Optional[str]:
+        if df.empty:
+            return None
 
-        if fallback_index is not None and 0 <= fallback_index < len(df.columns):
-            return df.columns[fallback_index]
+        posibles_norm = [self._norm(p) for p in posibles]
+        cols_norm = {col: self._norm(col) for col in df.columns}
+
+        # Match exacto
+        for col, norm in cols_norm.items():
+            if norm in posibles_norm:
+                return col
+
+        # Alias contenido
+        for col, norm in cols_norm.items():
+            if any(alias in norm for alias in posibles_norm):
+                return col
+
+        # Nombre contenido en alias
+        for col, norm in cols_norm.items():
+            if any(norm in alias for alias in posibles_norm):
+                return col
 
         return None
 
     # --------------------------------------------------------
-    #   LECTURA CRUDA DESDE BD ORIGEN
+    # Lectura cruda desde BD origen
     # --------------------------------------------------------
     def _load_raw(self) -> pd.DataFrame:
-        """Lee la tabla de clientes tal cual existe en DataPulse."""
         if not self._tabla_clientes:
             return pd.DataFrame()
 
         try:
-            self._db.connect()
-            query = f'SELECT * FROM "{self._tabla_clientes}"'
-            df = pd.read_sql_query(query, self._db.connection)
+            q = f'SELECT * FROM "{self._tabla_clientes}"'
+            df = self._db.read_query(q)
 
             if df.empty:
-                warn(f"Tabla de clientes '{self._tabla_clientes}' está vacía en BD origen.")
+                warn(f"Tabla '{self._tabla_clientes}' vacía.")
             else:
-                ok(f"Clientes crudos cargados desde '{self._tabla_clientes}': {len(df)} filas.")
+                ok(f"Clientes cargados: {len(df)}")
 
             return df
 
         except Exception as e:
-            error(f"Error leyendo clientes desde '{self._tabla_clientes}': {e}")
+            error(f"Error leyendo tabla clientes '{self._tabla_clientes}': {e}")
             return pd.DataFrame()
 
-        finally:
-            self._db.close()
-
     # --------------------------------------------------------
-    #   EXTRACTOR PRINCIPAL
+    # Extractor principal → DataFrame
     # --------------------------------------------------------
     def extract(self) -> pd.DataFrame:
-        """
-        Extrae clientes desde la BD origen y devuelve un DataFrame
-        normalizado mínimamente con:
-            - ruc
-            - razon_social
-
-        El mapeo al modelo final (campos adicionales, hashes, etc.)
-        se hará en el módulo transformers/DataMapper.
-        """
         df_raw = self._load_raw()
         if df_raw.empty:
-            warn("ClientsExtractor.extract() → DataFrame vacío.")
+            warn("ClientsExtractor.extract() → vacío")
             return pd.DataFrame(columns=["ruc", "razon_social"])
 
-        # Detectar columnas dinámicamente
-        col_ruc = self._pick_column(
-            df_raw,
-            candidates=["ruc", "documento", "doc"],
-            fallback_index=0
-        )
-        col_nombre = self._pick_column(
-            df_raw,
-            candidates=["razon", "cliente", "nombre", "name"],
-            fallback_index=1 if len(df_raw.columns) > 1 else 0
-        )
+        # Detectar columnas
+        col_ruc = self._pick_column(df_raw, ["ruc", "documento", "doc", "dni"])
+        col_name = self._pick_column(df_raw, ["razon", "cliente", "nombre", "rs", "name"])
 
         if not col_ruc:
-            warn("No se encontró columna de RUC en clientes. Se aborta extractor.")
+            error("No se detectó columna RUC → extractor aborta.")
             return pd.DataFrame(columns=["ruc", "razon_social"])
 
-        if not col_nombre:
-            warn("No se encontró columna de nombre/razón social en clientes. Se aborta extractor.")
+        if not col_name:
+            error("No se detectó columna nombre/razón social → extractor aborta.")
             return pd.DataFrame(columns=["ruc", "razon_social"])
 
         ok(f"Columna RUC detectada → {col_ruc}")
-        ok(f"Columna nombre detectada → {col_nombre}")
+        ok(f"Columna nombre detectada → {col_name}")
 
-        # Normalización mínima
-        clientes = pd.DataFrame()
-        clientes["ruc"] = df_raw[col_ruc].astype(str).apply(clean_ruc)
-        clientes["razon_social"] = df_raw[col_nombre].astype(str).apply(normalize_text)
+        # Normalización
+        df = pd.DataFrame()
+        df["ruc"] = df_raw[col_ruc].astype(str).apply(clean_ruc)
+        df["razon_social"] = df_raw[col_name].astype(str).apply(normalize_text)
 
         # Limpieza
-        before = len(clientes)
-        clientes = clientes[clientes["ruc"] != ""]
-        clientes = clientes.drop_duplicates(subset=["ruc"])
-        after = len(clientes)
+        antes = len(df)
+        df = df[df["ruc"] != ""]
+        df = df.drop_duplicates(subset=["ruc"])
+        despues = len(df)
 
-        ok(f"Clientes normalizados: {after} registros (filtrados {before - after}).")
+        ok(f"Clientes normalizados → {despues} (descartados {antes - despues})")
 
-        return clientes
+        return df
+
+    # --------------------------------------------------------
+    # HASH único por cliente
+    # --------------------------------------------------------
+    @staticmethod
+    def _make_hash(cli: dict) -> str:
+        try:
+            base = "|".join(str(cli.get(k, "")) for k in sorted(cli.keys()))
+            return hashlib.sha256(base.encode("utf-8")).hexdigest()
+        except Exception:
+            return ""
+
+    # --------------------------------------------------------
+    # Convertir DF → lista de dicts para Writers
+    # --------------------------------------------------------
+    def _df_to_records(self, df: pd.DataFrame) -> list[dict]:
+        registros: list[dict] = []
+
+        if df is None or df.empty:
+            return []
+
+        for _, row in df.iterrows():
+            cli = {
+                "ruc": row.get("ruc"),
+                "razon_social": row.get("razon_social"),
+            }
+            cli["source_hash"] = self._make_hash(cli)
+            registros.append(cli)
+
+        return registros
+
+    # --------------------------------------------------------
+    # API estándar para pipelines → ce.run()
+    # --------------------------------------------------------
+    def run(self) -> list[dict]:
+        """
+        1) Extrae clientes como DataFrame.
+        2) Convierte a registros list[dict] listos para ClientsWriter.
+        """
+        df = self.extract()
+
+        if df.empty:
+            warn("[ClientsExtractor] No hay clientes extraídos.")
+            return []
+
+        registros = self._df_to_records(df)
+        ok(f"[ClientsExtractor] Registros listos para carga: {len(registros)}")
+
+        return registros

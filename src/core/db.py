@@ -12,35 +12,59 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 import sqlite3
+from contextlib import contextmanager
+
 from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_config
 
 
-# -------------------------
+# =====================================================
 # Excepción de base de datos
-# -------------------------
+# =====================================================
 class DatabaseError(Exception):
     pass
 
 
-# -------------------------
-# Motor base universal
-# -------------------------
+# =====================================================
+# Context manager para conexiones seguras
+# =====================================================
+@contextmanager
+def safe_cursor(conn):
+    cur = None
+    try:
+        cur = conn.cursor()
+        yield cur
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        raise DatabaseError(f"DB Error: {e}")
+    finally:
+        if cur:
+            cur.close()
+
+
+# =====================================================
+# Motor universal
+# =====================================================
 class BaseDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self.connection = None
+        self.connection: Optional[sqlite3.Connection] = None
 
     # ---------------------
-    # Conexión
+    # Conexión segura
     # ---------------------
     def connect(self):
+        if self.connection:
+            return self.connection
+
         try:
             info(f"Conectando SQLite → {self.db_path}")
             self.connection = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
-                isolation_level=None
+                isolation_level="DEFERRED",
+                timeout=10
             )
             ok("Conexión establecida.")
             return self.connection
@@ -49,41 +73,38 @@ class BaseDB:
             raise DatabaseError(e)
 
     # ---------------------
-    # Cierre
+    # Cierre seguro
     # ---------------------
     def close(self):
         if self.connection:
             try:
                 self.connection.close()
                 ok("Conexión cerrada.")
-            except Exception:
+            except:
                 pass
 
     # ---------------------
     # Ejecutar sentencia
     # ---------------------
     def execute(self, query: str, params: Optional[tuple] = None):
-        if self.connection is None:
-            self.connect()
-
-        cur = self.connection.cursor()
-        try:
-            cur.execute(query, params or ())
-            return cur
-        except Exception as e:
-            error(f"Error execute(): {e}\nQuery: {query}")
-            raise DatabaseError(e)
+        conn = self.connect()
+        with safe_cursor(conn) as cur:
+            try:
+                cur.execute(query, params or ())
+                return cur
+            except Exception as e:
+                error(f"Error execute(): {e}\nQuery: {query}")
+                raise
 
     # ---------------------
-    # SELECT en DataFrame
+    # SELECT → DataFrame seguro
     # ---------------------
     def read_query(self, query: str):
         import pandas as pd
-        if self.connection is None:
-            self.connect()
 
+        conn = self.connect()
         try:
-            df = pd.read_sql_query(query, self.connection)
+            df = pd.read_sql_query(query, conn)
             ok(f"SELECT → {len(df)} filas.")
             return df
         except Exception as e:
@@ -91,43 +112,40 @@ class BaseDB:
             raise DatabaseError(e)
 
     # ---------------------
-    # SELECT * tabla
+    # SELECT * tabla (con verificación)
     # ---------------------
-    def fetch_all(self, table: str) -> List[Dict[str, Any]]:
-        if self.connection is None:
-            self.connect()
+    def fetch_all(self, table: str):
+        conn = self.connect()
+
+        # Validar tabla antes de ejecutar
+        if table not in self.get_tables():
+            raise DatabaseError(f"Tabla no encontrada: {table}")
 
         try:
-            cur = self.connection.cursor()
-            cur.execute(f"SELECT * FROM {table}")
-            rows = cur.fetchall()
-            cols = [c[0] for c in cur.description]
-            return [dict(zip(cols, row)) for row in rows]
+            q = f"SELECT * FROM {table}"
+            df = self.read_query(q)
+            return df.to_dict(orient="records")
         except Exception as e:
             error(f"Error fetch_all({table}): {e}")
-            raise DatabaseError(e)
+            raise
 
     # ---------------------
-    # Listado tablas
+    # Listar tablas
     # ---------------------
     def get_tables(self) -> List[str]:
-        if self.connection is None:
-            self.connect()
-
+        conn = self.connect()
         try:
-            cur = self.connection.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [r[0] for r in cur.fetchall()]
-            ok(f"Tablas detectadas: {tables}")
-            return tables
+            with safe_cursor(conn) as cur:
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                return [r[0] for r in cur.fetchall()]
         except Exception as e:
             error(f"No se pudieron listar tablas: {e}")
             raise DatabaseError(e)
 
 
-# -------------------------
-# BD Origen → DataPulse
-# -------------------------
+# =====================================================
+# BD Origen
+# =====================================================
 class SourceDB(BaseDB):
     def __init__(self):
         cfg = get_config()
@@ -135,14 +153,17 @@ class SourceDB(BaseDB):
         info(f"BD Origen configurada: {cfg.db_source}")
 
 
-# -------------------------
-# BD PulseForge interna
-# -------------------------
+# =====================================================
+# BD Interna PulseForge
+# =====================================================
 class PulseForgeDB(BaseDB):
     def __init__(self):
         cfg = get_config()
-        super().__init__(cfg.db_pulseforge)
-        info(f"BD PulseForge configurada: {cfg.db_pulseforge}")
+
+        # Corregido: antes decía cfg.db_pulseforge (NO existe)
+        super().__init__(cfg.db_destino)
+
+        info(f"BD PulseForge configurada: {cfg.db_destino}")
 
     # ---------------------
     # Insert seguro
@@ -170,9 +191,9 @@ class PulseForgeDB(BaseDB):
         self.execute(q, values + params)
 
 
-# -------------------------
-# BD de destino final → Nuevo PulseForge
-# -------------------------
+# =====================================================
+# BD Nueva (Destino final / export)
+# =====================================================
 class NewDB(BaseDB):
     def __init__(self):
         cfg = get_config()

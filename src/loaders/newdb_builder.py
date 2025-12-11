@@ -1,178 +1,143 @@
 # src/loaders/newdb_builder.py
 from __future__ import annotations
-import sys
 import sqlite3
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from src.core.logger import info, ok, warn, error
-from src.core.env_loader import get_config
+from src.core.env_loader import get_env
 
 
 class NewDBBuilder:
 
     def __init__(self):
-        info("Inicializando NewDBBuilder…")
+        self.db_path = Path(str(get_env("PULSEFORGE_NEWDB_PATH")).strip())
 
-        cfg = get_config()
+        info("=== PulseForge · Creación / Verificación de BD destino ===")
+        info(f"Ruta destino → {self.db_path}")
 
-        # 🔥 FIX REAL: atributo correcto del config
-        db_path = cfg.pulseforge_newdb_path
+        self._ensure_folder()
+        self._create_schema()
 
-        if not db_path:
-            error("PULSEFORGE_NEWDB_PATH no está definido en settings.json/.env")
-            raise ValueError("Ruta destino de BD no encontrada.")
+    # ---------------------------------------------------------
+    def _ensure_folder(self):
+        folder = self.db_path.parent
+        if not folder.exists():
+            folder.mkdir(parents=True, exist_ok=True)
+            ok(f"Carpeta creada: {folder}")
 
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
-        ok(f"Base destino → {self.db_path}")
-
-    # ======================================================
-    def build(self, reset: bool = False):
-        if reset and self.db_path.exists():
-            warn("RESET activo → eliminando BD previa.")
-            self.db_path.unlink()
-
+    # ---------------------------------------------------------
+    def _create_schema(self):
         conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
 
-        try:
-            cur = conn.cursor()
-            info("Creando estructura PulseForge …")
+        info("Creando tablas base PulseForge…")
 
-            # ============================================
-            # TABLA CLIENTES
-            # ============================================
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS clientes_pf (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ruc TEXT NOT NULL,
-                    razon_social TEXT,
-                    source_hash TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+        # -----------------------------------------------------
+        # BANCOS
+        # -----------------------------------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS bancos_pf (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_hash TEXT UNIQUE,
+            fecha TEXT,
+            tipo_mov TEXT,
+            descripcion TEXT,
+            operacion TEXT,
+            destinatario TEXT,
+            tipo_documento TEXT,
+            monto REAL,
+            moneda TEXT,
+            banco_codigo TEXT
+        );
+        """)
 
-            # ============================================
-            # TABLA FACTURAS
-            # ============================================
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS facturas_pf (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ruc TEXT,
-                    cliente_generador TEXT,
-                    serie TEXT,
-                    numero TEXT,
-                    combinada TEXT,
-                    fecha_emision TEXT,
-                    vencimiento TEXT,
-                    subtotal REAL,
-                    igv REAL,
-                    total REAL,
-                    detraccion REAL,
-                    total_neto_cobrado REAL,
-                    fue_cobrado INTEGER DEFAULT 0,
-                    fecha_cobro TEXT,
-                    match_id INTEGER,
-                    source_hash TEXT UNIQUE,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+        # -----------------------------------------------------
+        # CLIENTES
+        # -----------------------------------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS clientes_pf (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_hash TEXT UNIQUE,
+            ruc TEXT,
+            razon_social TEXT
+        );
+        """)
 
-            # ============================================
-            # TABLA MOVIMIENTOS
-            # ============================================
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS movimientos_pf (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    banco_codigo TEXT,
-                    fecha TEXT,
-                    tipo_mov TEXT,
-                    descripcion TEXT,
-                    monto_original REAL,
-                    moneda_original TEXT,
-                    monto_pen REAL,
-                    operacion TEXT,
-                    destinatario TEXT,
-                    tipo_documento TEXT,
-                    es_cuenta_empresa INTEGER,
-                    es_cuenta_detraccion INTEGER,
-                    es_cuenta_principal INTEGER,
-                    source_hash TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+        # -----------------------------------------------------
+        # FACTURAS
+        # -----------------------------------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS facturas_pf (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_hash TEXT UNIQUE,
+            ruc TEXT,
+            cliente_generador TEXT,
+            serie TEXT,
+            numero TEXT,
+            combinada TEXT,
+            fecha_emision TEXT,
+            vencimiento TEXT,
+            subtotal REAL,
+            igv REAL,
+            total REAL,
+            estado_fs TEXT,
+            estado_cont TEXT,
+            fue_cobrado INTEGER,
+            match_id TEXT
+        );
+        """)
 
-            # ============================================
-            # TABLA MATCHES RESUMEN
-            # ============================================
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS matches_pf (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    factura_id INTEGER,
-                    movimiento_id INTEGER,
-                    monto_factura REAL,
-                    monto_banco REAL,
-                    diferencia REAL,
-                    match_tipo TEXT,
-                    score REAL,
-                    razon_ia TEXT,
-                    source_hash TEXT UNIQUE,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+        # -----------------------------------------------------
+        # CALCULOS
+        # -----------------------------------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS calculos_pf (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            factura_hash TEXT,
+            subtotal REAL,
+            igv REAL,
+            detraccion REAL,
+            total_final REAL,
+            dias_credito INTEGER,
+            fecha_pago TEXT,
+            variacion REAL
+        );
+        """)
 
-            # ============================================
-            # TABLA MATCH DETALLE
-            # ============================================
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS match_detalles_pf (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    factura_id INTEGER,
-                    movimiento_id INTEGER,
-                    serie TEXT,
-                    numero TEXT,
-                    combinada TEXT,
-                    ruc TEXT,
-                    cliente TEXT,
-                    fecha_mov TEXT,
-                    banco_codigo TEXT,
-                    descripcion_banco TEXT,
-                    tipo_comparacion TEXT,
-                    monto_ref REAL,
-                    monto_banco REAL,
-                    diff_monto REAL,
-                    es_detraccion_bn INTEGER,
-                    coincide_fecha INTEGER,
-                    coincide_monto INTEGER,
-                    coincide_nombre INTEGER,
-                    dias_diff_fecha INTEGER,
-                    score_final REAL,
-                    resultado_final TEXT,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+        # -----------------------------------------------------
+        # MATCH
+        # -----------------------------------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS match_pf (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            factura_hash TEXT,
+            banco_hash TEXT,
+            monto_factura REAL,
+            monto_banco REAL,
+            diferencia REAL,
+            porcentaje_match REAL,
+            estado TEXT,
+            fecha_match TEXT
+        );
+        """)
 
-            # ============================================
-            # ÍNDICES
-            # ============================================
-            cur.executescript("""
-                CREATE INDEX IF NOT EXISTS idx_facturas_ruc ON facturas_pf(ruc);
-                CREATE INDEX IF NOT EXISTS idx_facturas_match ON facturas_pf(match_id);
-                CREATE INDEX IF NOT EXISTS idx_movimientos_banco_fecha ON movimientos_pf(banco_codigo, fecha);
-                CREATE INDEX IF NOT EXISTS idx_matches_factura ON matches_pf(factura_id);
-                CREATE INDEX IF NOT EXISTS idx_matches_movimiento ON matches_pf(movimiento_id);
-            """)
+        # -----------------------------------------------------
+        # AUDITORÍA
+        # -----------------------------------------------------
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS auditoria_pf (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            evento TEXT,
+            detalle TEXT,
+            fecha TEXT
+        );
+        """)
 
-            conn.commit()
-            ok("✔ BD PulseForge creada correctamente.")
-
-        except Exception as e:
-            error(f"Error creando BD PulseForge → {e}")
-            raise
-
-        finally:
-            conn.close()
+        conn.commit()
+        conn.close()
+        ok("Todas las tablas creadas ✔")

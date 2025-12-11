@@ -17,9 +17,12 @@
  ┣ 📜 constants.json
  ┣ 📜 settings.json
 📂 data
+ ┣ 📜 pulseforge.sqlite
  ┃ 📂 exports
  ┃ 📂 logs
  ┃ 📂 temp
+ ┃  ┣ 📜 preview_bankextractor.csv
+ ┃  ┣ 📜 preview_clientsextractor.csv
 📂 logs
  ┣ 📜 pulseforge.log
 📂 src
@@ -44,6 +47,7 @@
  ┃ 📂 extractors
  ┃  ┣ 📜 bank_extractor.py
  ┃  ┣ 📜 clients_extractor.py
+ ┃  ┣ 📜 debug_facturas_cols.py
  ┃  ┣ 📜 invoices_extractor.py
  ┃  ┣ 📜 test_extractors.py
  ┃  ┃ 📂 __pycache__
@@ -54,10 +58,8 @@
  ┃  ┣ 📜 bank_writer.py
  ┃  ┣ 📜 clients_writer.py
  ┃  ┣ 📜 invoice_writer.py
- ┃  ┣ 📜 match_writer.py
  ┃  ┣ 📜 newdb_builder.py
- ┃  ┣ 📜 raw_writer.py
- ┃  ┣ 📜 test_raw_loader.py
+ ┃  ┣ 📜 test_loaders.py
  ┃  ┃ 📂 __pycache__
  ┃  ┃  ┣ 📜 bank_writer.cpython-311.pyc
  ┃  ┃  ┣ 📜 clients_writer.cpython-311.pyc

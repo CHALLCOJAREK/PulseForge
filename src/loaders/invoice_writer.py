@@ -1,12 +1,12 @@
 # src/loaders/invoice_writer.py
 from __future__ import annotations
 
-import sys
 import sqlite3
-import hashlib
 from pathlib import Path
-from typing import List, Dict
+import sys
+import hashlib
 
+# Bootstrap
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -15,180 +15,157 @@ from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def _get_newdb_path() -> Path:
-    db_path = str(get_env("PULSEFORGE_NEWDB_PATH", default="")).strip()
-    if not db_path:
-        error("PULSEFORGE_NEWDB_PATH no configurado en .env")
-        raise ValueError("Falta PULSEFORGE_NEWDB_PATH")
-
-    file = Path(db_path)
-    file.parent.mkdir(parents=True, exist_ok=True)
-    return file
-
-
-def _get_connection() -> sqlite3.Connection:
-    db = _get_newdb_path()
-    if not db.exists():
-        warn(f"La BD destino no existe aún → {db}")
-    return sqlite3.connect(db)
-
-
-def _hash_factura(fac: dict) -> str:
-    base = f"{fac.get('ruc','')}|{fac.get('combinada','')}|{fac.get('fecha_emision','')}"
-    return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
+TABLE_NAME = "facturas_pf"
 
 
 # ============================================================
-#  INVOICE WRITER (compatible con list[dict])
+#                INVOICE WRITER · PULSEFORGE 2025
 # ============================================================
-
 class InvoiceWriter:
 
-    REQUIRED_FIELDS = [
-        "ruc",
-        "cliente_generador",
-        "subtotal",
-        "serie",
-        "numero",
-        "combinada",
-        "estado_fs",
-        "estado_cont",
-        "fecha_emision",
-        "fecha_limite_pago",
-        "fecha_inicio_ventana",
-        "fecha_fin_ventana",
-        "neto_recibido",
-        "total_con_igv",
-        "detraccion_monto",
-    ]
-
     def __init__(self):
-        info("Inicializando InvoiceWriter…")
-        self.db_path = _get_newdb_path()
-        ok(f"BD destino: {self.db_path}")
+        db_path = str(get_env("PULSEFORGE_NEWDB_PATH")).strip()
 
-    # --------------------------------------------------------
-    def _ensure_table(self, conn):
+        if not db_path:
+            raise ValueError("[InvoiceWriter] ❌ Falta PULSEFORGE_NEWDB_PATH en .env")
+
+        self.db_path = Path(db_path)
+        info(f"[InvoiceWriter] BD destino → {self.db_path}")
+
+        self._ensure_table()
+
+
+    # ============================================================
+    #              CREAR TABLA E ÍNDICES SI NO EXISTEN
+    # ============================================================
+    def _ensure_table(self):
+        conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        cur.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='facturas_pf'
+
+        info("[InvoiceWriter] Verificando tabla pf_invoices…")
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_hash TEXT UNIQUE,
+                ruc TEXT,
+                cliente_generador TEXT,
+                serie TEXT,
+                numero TEXT,
+                combinada TEXT,
+                fecha_emision TEXT,
+                vencimiento TEXT,
+                subtotal REAL,
+                igv REAL,
+                total REAL,
+                estado_fs TEXT,
+                estado_cont TEXT,
+                fue_cobrado INTEGER,
+                match_id TEXT
+            );
         """)
-        if not cur.fetchone():
-            error("La tabla facturas_pf NO existe. Ejecuta newdb_builder.py")
-            raise RuntimeError("Tabla facturas_pf no encontrada.")
 
-    # --------------------------------------------------------
-    def _normalize_record(self, fac: dict) -> dict:
-        """
-        Limpia 1 factura y asegura todas las columnas obligatorias.
-        """
-        rec = fac.copy()
-
-        # Asegurar todas las columnas obligatorias
-        for f in self.REQUIRED_FIELDS:
-            if f not in rec:
-                warn(f"[FACTURA] Falta '{f}' → se usa None.")
-                rec[f] = None
-
-        # Normalizar tipos numéricos
-        for n in ["subtotal", "neto_recibido", "total_con_igv", "detraccion_monto"]:
-            try:
-                rec[n] = float(rec.get(n, 0) or 0)
-            except:
-                rec[n] = 0
-
-        # Todas las fechas a texto YYYY-MM-DD
-        for f in [
-            "fecha_emision",
-            "fecha_limite_pago",
-            "fecha_inicio_ventana",
-            "fecha_fin_ventana",
-        ]:
-            v = rec.get(f)
-            rec[f] = str(v) if v not in (None, "", "NaT") else None
-
-        # Estado pago
-        rec["estado_pago"] = rec.get("estado_pago", "pendiente") or "pendiente"
-
-        # Hash trazabilidad
-        rec["source_hash"] = _hash_factura(rec)
-
-        return rec
-
-    # --------------------------------------------------------
-    def save_facturas(self, facturas: List[Dict], reset=False) -> int:
-        """
-        Inserta facturas (list[dict]) en facturas_pf.
-        """
-        if not facturas:
-            warn("Lista de facturas vacía. No se insertará nada.")
-            return 0
-
-        # Normalizar cada registro
-        registros = [self._normalize_record(f) for f in facturas]
-
-        conn = _get_connection()
-        self._ensure_table(conn)
-        cur = conn.cursor()
-
-        if reset:
-            warn("Reset=True → limpiando tabla facturas_pf")
-            cur.execute("DELETE FROM facturas_pf")
-
-        info("Insertando facturas…")
-
-        cur.executemany("""
-            INSERT INTO facturas_pf (
-                ruc,
-                cliente_generador,
-                subtotal,
-                serie,
-                numero,
-                combinada,
-                estado_fs,
-                estado_cont,
-                fecha_emision,
-                fecha_limite_pago,
-                fecha_inicio_ventana,
-                fecha_fin_ventana,
-                neto_recibido,
-                total_con_igv,
-                detraccion_monto,
-                estado_pago,
-                source_hash
-            )
-            VALUES (
-                :ruc,
-                :cliente_generador,
-                :subtotal,
-                :serie,
-                :numero,
-                :combinada,
-                :estado_fs,
-                :estado_cont,
-                :fecha_emision,
-                :fecha_limite_pago,
-                :fecha_inicio_ventana,
-                :fecha_fin_ventana,
-                :neto_recibido,
-                :total_con_igv,
-                :detraccion_monto,
-                :estado_pago,
-                :source_hash
-            )
-        """, registros)
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_inv_hash      ON {TABLE_NAME}(source_hash);")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_inv_serie_num ON {TABLE_NAME}(serie, numero);")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_inv_ruc       ON {TABLE_NAME}(ruc);")
 
         conn.commit()
-        inserted = len(registros)
-        ok(f"Facturas insertadas: {inserted}")
         conn.close()
-        return inserted
 
-    # Alias
-    def save(self, facturas: List[Dict], reset=False) -> int:
-        return self.save_facturas(facturas, reset)
+        ok("[InvoiceWriter] Tabla lista ✔")
+
+
+    # ============================================================
+    #                       GENERAR HASH
+    # ============================================================
+    def _make_hash(self, f: dict) -> str:
+        """
+        Genera un hash único en base a los campos fundamentales de una factura.
+        Inmutable y consistente.
+        """
+        base = (
+            f"{f.get('ruc','')}"
+            f"|{f.get('serie','')}"
+            f"|{f.get('numero','')}"
+            f"|{f.get('subtotal','')}"
+            f"|{f.get('total','')}"
+        )
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+    # ============================================================
+    #                         VALIDACIÓN
+    # ============================================================
+    def _validate_factura(self, f: dict) -> bool:
+        required = ["ruc", "subtotal", "igv", "total"]
+
+        for key in required:
+            if key not in f or f[key] in ["", None]:
+                warn(f"[InvoiceWriter] Factura omitida → falta campo: {key}")
+                return False
+
+        return True
+
+
+    # ============================================================
+    #                     GUARDAR MUCHAS FACTURAS
+    # ============================================================
+    def save_many(self, facturas: list[dict]):
+        if not facturas:
+            warn("[InvoiceWriter] No hay facturas para guardar.")
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+
+        info(f"[InvoiceWriter] Guardando {len(facturas)} facturas…")
+
+        try:
+            sql = f"""
+                INSERT OR REPLACE INTO {TABLE_NAME} (
+                    source_hash, ruc, cliente_generador, serie, numero, combinada,
+                    fecha_emision, vencimiento, subtotal, igv, total,
+                    estado_fs, estado_cont, fue_cobrado, match_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+
+            validas = 0
+
+            for f in facturas:
+
+                if not self._validate_factura(f):
+                    continue
+
+                # 🚀 Generar hash automático si no existe
+                if not f.get("source_hash"):
+                    f["source_hash"] = self._make_hash(f)
+
+                cur.execute(sql, (
+                    f["source_hash"],
+                    f["ruc"],
+                    f.get("cliente_generador"),
+                    f.get("serie"),
+                    f.get("numero"),
+                    f.get("combinada"),
+                    str(f["fecha_emision"]) if f.get("fecha_emision") else None,
+                    str(f["vencimiento"]) if f.get("vencimiento") else None,
+                    f.get("subtotal"),
+                    f.get("igv"),
+                    f.get("total"),
+                    f.get("estado_fs"),
+                    f.get("estado_cont"),
+                    f.get("fue_cobrado", 0),
+                    f.get("match_id")
+                ))
+
+                validas += 1
+
+            conn.commit()
+            ok(f"[InvoiceWriter] ✔ Facturas guardadas: {validas}")
+
+        except Exception as e:
+            conn.rollback()
+            error(f"[InvoiceWriter] ❌ Error guardando facturas → {e}")
+
+        finally:
+            conn.close()

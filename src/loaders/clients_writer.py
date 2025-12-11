@@ -1,185 +1,135 @@
 # src/loaders/clients_writer.py
 from __future__ import annotations
 
-# ============================================================
-#  PULSEFORGE · CLIENTS WRITER
-#  Inserta clientes normalizados en clientes_pf
-# ============================================================
-import sys
 import sqlite3
-import hashlib
 from pathlib import Path
+import sys
+import hashlib
 
-import pandas as pd
-
-# ------------------------------------------------------------
-#  BOOTSTRAP
-# ------------------------------------------------------------
+# Bootstrap dinámico
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
 from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
-from src.extractors.clients_extractor import ClientsExtractor
+
+
+TABLE_NAME = "clientes_pf"
 
 
 # ============================================================
-#  HELPERS
+#              CLIENT WRITER · PULSEFORGE 2025
 # ============================================================
-
-def _get_newdb_path() -> Path:
-    db = get_env("PULSEFORGE_NEWDB_PATH")
-    if not db:
-        error("PULSEFORGE_NEWDB_PATH faltante en .env")
-        raise ValueError("Falta configuración DB destino.")
-
-    return Path(db)
-
-
-def _get_connection() -> sqlite3.Connection:
-    db_file = _get_newdb_path()
-
-    if not db_file.exists():
-        error(f"La base de datos destino no existe → {db_file}")
-        raise FileNotFoundError(db_file)
-
-    info(f"Conectando a BD PulseForge → {db_file}")
-    return sqlite3.connect(db_file)
-
-
-def _compute_hash(row: pd.Series) -> str:
-    """
-    Hash único: RUC + Razón Social.
-    Garantiza unicidad y auditoría.
-    """
-    base = f"{row.get('RUC','')}|{row.get('Razon_Social','')}"
-    return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
-
-
-# ============================================================
-#  CLIENTS WRITER
-# ============================================================
-
 class ClientsWriter:
 
-    EXPECTED_COLS = ["RUC", "Razon_Social"]
+    def __init__(self):
+        """Inicializa el writer y prepara la BD destino."""
+        db_path = str(get_env("PULSEFORGE_NEWDB_PATH")).strip()
 
-    def __init__(self) -> None:
-        info("Inicializando ClientsWriter…")
-        self.db_path = _get_newdb_path()
-        ok(f"ClientsWriter listo. BD destino = {self.db_path}")
+        if not db_path:
+            raise ValueError("❌ Falta PULSEFORGE_NEWDB_PATH en .env")
 
-    # --------------------------------------------------------
-    def _ensure_table(self, conn: sqlite3.Connection):
+        self.db_path = Path(db_path)
+        info(f"[ClientsWriter] BD destino → {self.db_path}")
+
+        self._ensure_table()
+
+    # ============================================================
+    #               CREAR TABLA BASE
+    # ============================================================
+    def _ensure_table(self):
+        conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        cur.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='clientes_pf'
+
+        info("[ClientsWriter] Verificando tabla pf_clients…")
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_hash TEXT UNIQUE,
+                ruc TEXT,
+                razon_social TEXT
+            );
         """)
-        if not cur.fetchone():
-            error("Tabla 'clientes_pf' NO existe. Ejecuta newdb_builder.py primero.")
-            raise RuntimeError("clientes_pf no encontrada.")
 
-    # --------------------------------------------------------
-    def _normalize(self, df: pd.DataFrame) -> pd.DataFrame:
+        # Índices críticos para búsquedas por RUC
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_cli_hash ON {TABLE_NAME}(source_hash);")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_cli_ruc  ON {TABLE_NAME}(ruc);")
+
+        conn.commit()
+        conn.close()
+
+        ok("[ClientsWriter] Tabla lista ✔")
+
+    # ============================================================
+    #               GENERADOR DE HASH
+    # ============================================================
+    def _make_hash(self, c: dict) -> str:
         """
-        Valida columnas, limpia strings y genera hash.
+        Genera un hash único basado en datos estables del cliente.
         """
-        if df is None or df.empty:
-            warn("DF de clientes vacío. No se insertará nada.")
-            return pd.DataFrame(columns=self.EXPECTED_COLS + ["source_hash"])
+        base = f"{c.get('ruc','')}|{c.get('razon_social','')}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
-        df_norm = df.copy()
+    # ============================================================
+    #               VALIDACIÓN FLEXIBLE
+    # ============================================================
+    def _validate_cliente(self, c: dict) -> bool:
+        required = ["ruc", "razon_social"]
 
-        # Asegurar columnas mínimas
-        for c in self.EXPECTED_COLS:
-            if c not in df_norm.columns:
-                warn(f"[CLIENT_WRITER] Columna faltante '{c}', se crea vacía.")
-                df_norm[c] = ""
+        for k in required:
+            if k not in c or c[k] in ["", None]:
+                warn(f"[ClientsWriter] Cliente omitido, falta campo: {k}")
+                return False
 
-        # Limpieza mínima
-        df_norm["RUC"] = df_norm["RUC"].astype(str).str.strip()
-        df_norm["Razon_Social"] = df_norm["Razon_Social"].astype(str).str.strip()
+        return True
 
-        # Hash único
-        df_norm["source_hash"] = df_norm.apply(_compute_hash, axis=1)
+    # ============================================================
+    #               GUARDADO MASIVO
+    # ============================================================
+    def save_many(self, clientes: list[dict]):
+        if not clientes:
+            warn("[ClientsWriter] No hay clientes para guardar.")
+            return
 
-        # Orden final
-        return df_norm[["RUC", "Razon_Social", "source_hash"]]
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
 
-    # --------------------------------------------------------
-    def save_clientes(self, df: pd.DataFrame, reset=False) -> int:
-        """
-        Inserta clientes normalizados en clientes_pf.
-        """
-        df_norm = self._normalize(df)
+        info(f"[ClientsWriter] Guardando {len(clientes)} clientes…")
 
-        conn = _get_connection()
         try:
-            self._ensure_table(conn)
+            sql = f"""
+                INSERT OR REPLACE INTO {TABLE_NAME} (
+                    source_hash, ruc, razon_social
+                ) VALUES (?, ?, ?);
+            """
 
-            cur = conn.cursor()
+            validos = 0
 
-            if reset:
-                warn("Reset=True → limpiando tabla clientes_pf")
-                cur.execute("DELETE FROM clientes_pf")
+            for c in clientes:
 
-            info("Insertando clientes en clientes_pf…")
+                if not self._validate_cliente(c):
+                    continue
 
-            rows = df_norm.to_dict(orient="records")
+                # 🚀 Generar hash si no existe
+                if not c.get("source_hash"):
+                    c["source_hash"] = self._make_hash(c)
 
-            cur.executemany("""
-                INSERT INTO clientes_pf (
-                    ruc,
-                    razon_social,
-                    source_hash
-                )
-                VALUES (
-                    :RUC,
-                    :Razon_Social,
-                    :source_hash
-                )
-            """, rows)
+                cur.execute(sql, (
+                    c["source_hash"],
+                    c["ruc"],
+                    c["razon_social"],
+                ))
+
+                validos += 1
 
             conn.commit()
-
-            ok(f"Clientes insertados en clientes_pf: {len(rows)}")
-            return len(rows)
+            ok(f"[ClientsWriter] ✔ Clientes guardados: {validos}")
 
         except Exception as e:
-            error(f"Error insertando clientes: {e}")
-            raise
+            conn.rollback()
+            error(f"[ClientsWriter] ❌ Error guardando clientes → {e}")
 
         finally:
             conn.close()
-
-    # --------------------------------------------------------
-    # 🚀 NUEVO: alias estándar requerido por main.py
-    # --------------------------------------------------------
-    def save(self, df: pd.DataFrame, reset=False) -> int:
-        """
-        Alias universal para mantener compatibilidad con PulseForge:
-        main.py llama → ClientsWriter().save(df)
-        """
-        return self.save_clientes(df, reset=reset)
-
-
-# ============================================================
-#  TEST LOCAL
-# ============================================================
-if __name__ == "__main__":
-    try:
-        info("⚙️ Test local de ClientsWriter…")
-
-        ce = ClientsExtractor()
-        df = ce.get_clientes_mapeados()
-        ok(f"Clientes extraídos normalizados: {len(df)}")
-
-        writer = ClientsWriter()
-        inserted = writer.save_clientes(df, reset=True)
-
-        ok(f"Test de ClientsWriter completado. Filas: {inserted}")
-
-    except Exception as e:
-        error(f"Fallo en test de ClientsWriter: {e}")

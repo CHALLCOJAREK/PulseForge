@@ -1,15 +1,12 @@
 # src/loaders/bank_writer.py
 from __future__ import annotations
 
-# ============================================================
-#  PULSEFORGE · BANK WRITER (COMPATIBLE CON list[dict])
-# ============================================================
-import sys
 import sqlite3
-import hashlib
 from pathlib import Path
-from typing import List, Dict
+import sys
+import hashlib
 
+# Bootstrap
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -18,154 +15,151 @@ from src.core.logger import info, ok, warn, error
 from src.core.env_loader import get_env
 
 
-# ------------------------------------------------------------
-#  HELPERS
-# ------------------------------------------------------------
-def _get_newdb_path() -> Path:
-    db_path = str(get_env("PULSEFORGE_NEWDB_PATH", default="")).strip()
-    if not db_path:
-        error("PULSEFORGE_NEWDB_PATH no configurado")
-        raise ValueError("Falta PULSEFORGE_NEWDB_PATH")
-
-    file = Path(db_path)
-    file.parent.mkdir(parents=True, exist_ok=True)
-    return file
-
-
-def _get_connection() -> sqlite3.Connection:
-    db = _get_newdb_path()
-    if not db.exists():
-        warn(f"⚠ BD destino no existe aún → {db}")
-    return sqlite3.connect(db)
-
-
-def _hash_mov(m: dict) -> str:
-    base = f"{m.get('Banco','')}|{m.get('Operacion','')}|{m.get('Fecha','')}"
-    return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
+TABLE_NAME = "bancos_pf"
 
 
 # ============================================================
-#  BANK WRITER (NUEVA ARQUITECTURA)
+#              BANK WRITER · PULSEFORGE 2025
 # ============================================================
 class BankWriter:
 
-    REQUIRED_FIELDS = [
-        "Banco",
-        "Fecha",
-        "Descripcion",
-        "Monto",
-        "Moneda",
-        "Operacion",
-        "Tipo_Mov",
-        "Destinatario",
-        "Tipo_Documento",
-    ]
-
     def __init__(self):
-        info("Inicializando BankWriter…")
-        self.db_path = _get_newdb_path()
-        ok(f"BD destino: {self.db_path}")
+        """Inicializa el writer y prepara la BD destino."""
+        db_path = str(get_env("PULSEFORGE_NEWDB_PATH")).strip()
 
-    # --------------------------------------------------------
-    def _ensure_table(self, conn):
+        if not db_path:
+            raise ValueError("[BankWriter] ❌ Falta PULSEFORGE_NEWDB_PATH en .env")
+
+        self.db_path = Path(db_path)
+        info(f"[BankWriter] BD destino → {self.db_path}")
+
+        self._ensure_table()
+
+    # ============================================================
+    #               GENERADOR DE HASH
+    # ============================================================
+    def _make_hash(self, data: dict) -> str:
+        """
+        Crea un hash único basado en los valores importantes del movimiento.
+        """
+        base = "|".join([
+            str(data.get("fecha", "")),
+            str(data.get("tipo_mov", "")),
+            str(data.get("descripcion", "")),
+            str(data.get("operacion", "")),
+            str(data.get("monto", "")),
+            str(data.get("moneda", "")),
+            str(data.get("banco_codigo", "")),
+        ])
+
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+    # ============================================================
+    #            CREAR TABLA (si no existe)
+    # ============================================================
+    def _ensure_table(self):
+        conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
-        cur.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='movimientos_pf'
+
+        info("[BankWriter] Verificando tabla pf_bank_movs…")
+
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_hash TEXT UNIQUE,
+                fecha TEXT,
+                tipo_mov TEXT,
+                descripcion TEXT,
+                operacion TEXT,
+                destinatario TEXT,
+                tipo_documento TEXT,
+                monto REAL,
+                moneda TEXT,
+                banco_codigo TEXT
+            );
         """)
-        if not cur.fetchone():
-            error("Tabla movimientos_pf NO existe. Ejecuta newdb_builder.py")
-            raise RuntimeError("movimientos_pf no encontrada.")
 
-    # --------------------------------------------------------
-    def _normalize_record(self, mov: dict) -> dict:
-        """
-        Recibe un diccionario y asegura que esté completo y limpio.
-        """
-        rec = mov.copy()
-
-        # Asegurar columnas
-        for col in self.REQUIRED_FIELDS:
-            if col not in rec:
-                warn(f"[BANK] Falta '{col}' → None")
-                rec[col] = None
-
-        # Normalizar monto
-        try:
-            rec["Monto"] = float(rec.get("Monto", 0) or 0)
-        except:
-            rec["Monto"] = 0
-
-        # Normalizar fechas a string
-        rec["Fecha"] = str(rec.get("Fecha") or "")
-
-        # Convertir todo texto a str
-        for t in [
-            "Banco", "Descripcion", "Moneda", "Operacion",
-            "Tipo_Mov", "Destinatario", "Tipo_Documento"
-        ]:
-            v = rec.get(t)
-            rec[t] = str(v) if v not in (None, "") else ""
-
-        # Hash trazabilidad
-        rec["source_hash"] = _hash_mov(rec)
-
-        return rec
-
-    # --------------------------------------------------------
-    def save_bancos(self, movimientos: List[Dict], reset=False) -> int:
-        """
-        Inserta movimientos bancarios (list[dict]) en movimientos_pf.
-        """
-        if not movimientos:
-            warn("Lista de movimientos vacía.")
-            return 0
-
-        registros = [self._normalize_record(m) for m in movimientos]
-
-        conn = _get_connection()
-        self._ensure_table(conn)
-        cur = conn.cursor()
-
-        if reset:
-            warn("Reset=True → limpiando movimientos_pf…")
-            cur.execute("DELETE FROM movimientos_pf")
-
-        info("Insertando movimientos bancarios…")
-
-        cur.executemany("""
-            INSERT INTO movimientos_pf (
-                banco,
-                fecha,
-                descripcion,
-                monto,
-                moneda,
-                operacion,
-                tipo_mov,
-                destinatario,
-                tipo_documento,
-                source_hash
-            )
-            VALUES (
-                :Banco,
-                :Fecha,
-                :Descripcion,
-                :Monto,
-                :Moneda,
-                :Operacion,
-                :Tipo_Mov,
-                :Destinatario,
-                :Tipo_Documento,
-                :source_hash
-            )
-        """, registros)
+        # Índices críticos para performance del match
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_bank_hash  ON {TABLE_NAME}(source_hash);")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_bank_oper  ON {TABLE_NAME}(operacion);")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_bank_banco ON {TABLE_NAME}(banco_codigo);")
+        cur.execute(f"CREATE INDEX IF NOT EXISTS idx_bank_fecha ON {TABLE_NAME}(fecha);")
 
         conn.commit()
-        inserted = len(registros)
-        ok(f"Movimientos insertados: {inserted}")
         conn.close()
-        return inserted
 
-    # Alias
-    def save(self, movimientos: List[Dict], reset=False) -> int:
-        return self.save_bancos(movimientos, reset)
+        ok("[BankWriter] Tabla lista ✔")
+
+    # ============================================================
+    #               VALIDACIÓN FLEXIBLE
+    # ============================================================
+    def _validate_mov(self, m: dict) -> bool:
+        """
+        Valida campos esenciales sin exigir source_hash,
+        porque ahora se genera automáticamente.
+        """
+        required = ["monto", "banco_codigo"]
+
+        for key in required:
+            if key not in m or m[key] in ("", None):
+                warn(f"[BankWriter] Movimiento omitido → falta campo '{key}'")
+                return False
+
+        return True
+
+    # ============================================================
+    #                GUARDAR LISTA DE MOVIMIENTOS
+    # ============================================================
+    def save_many(self, movimientos: list[dict]):
+        if not movimientos:
+            warn("[BankWriter] No hay movimientos para guardar.")
+            return
+
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+
+        info(f"[BankWriter] Guardando {len(movimientos)} movimientos…")
+
+        try:
+            sql = f"""
+                INSERT OR REPLACE INTO {TABLE_NAME} (
+                    source_hash, fecha, tipo_mov, descripcion, operacion,
+                    destinatario, tipo_documento, monto, moneda, banco_codigo
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+
+            validos = 0
+
+            for m in movimientos:
+
+                if not self._validate_mov(m):
+                    continue
+
+                # 🚀 Generar hash si no viene del extractor
+                if not m.get("source_hash"):
+                    m["source_hash"] = self._make_hash(m)
+
+                cur.execute(sql, (
+                    m["source_hash"],
+                    m.get("fecha"),
+                    m.get("tipo_mov"),
+                    m.get("descripcion"),
+                    m.get("operacion"),
+                    m.get("destinatario"),
+                    m.get("tipo_documento"),
+                    m.get("monto", 0.0),
+                    m.get("moneda"),
+                    m.get("banco_codigo"),
+                ))
+
+                validos += 1
+
+            conn.commit()
+            ok(f"[BankWriter] ✔ Movimientos insertados: {validos}")
+
+        except Exception as e:
+            conn.rollback()
+            error(f"[BankWriter] ❌ Error guardando movimientos → {e}")
+
+        finally:
+            conn.close()
