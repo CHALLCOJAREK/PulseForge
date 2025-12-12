@@ -5,7 +5,6 @@
  ┣ 📜 gitpush.py
  ┣ 📜 README.md
  ┣ 📜 requirements.txt
- ┣ 📜 run_pulseforge_setup.py
 📂 .git  (contenido limitado)
  ┃ 📂 hooks
  ┃ 📂 info
@@ -16,12 +15,13 @@
  ┣ 📜 constants.json
  ┣ 📜 settings.json
 📂 data
- ┣ 📜 pulseforge.sqlite
  ┃ 📂 exports
  ┃ 📂 logs
  ┃ 📂 temp
  ┃  ┣ 📜 preview_bankextractor.csv
  ┃  ┣ 📜 preview_clientsextractor.csv
+📂 db
+ ┣ 📜 pulseforge.sqlite
 📂 logs
  ┣ 📜 pulseforge.log
 📂 src

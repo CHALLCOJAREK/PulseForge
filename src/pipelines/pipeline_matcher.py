@@ -43,14 +43,24 @@ class PipelineMatcher:
     # CARGA DE DATOS DESDE BD
     # --------------------------------------------------------
     def _load_data(self):
-        """Carga facturas y bancos desde la BD PulseForge."""
         try:
             conn = self.db.connect()
 
-            df_fact = pd.read_sql_query("SELECT * FROM facturas_pf", conn)
-            df_bank = pd.read_sql_query("SELECT * FROM bancos_pf", conn)
+            df_fact = pd.read_sql_query(
+                """
+                SELECT *
+                FROM facturas_pf
+                WHERE IFNULL(fue_cobrado, 0) = 0
+                """,
+                conn
+            )
 
-            ok(f"Facturas cargadas: {len(df_fact)}")
+            df_bank = pd.read_sql_query(
+                "SELECT * FROM bancos_pf",
+                conn
+            )
+
+            ok(f"Facturas pendientes de cobro: {len(df_fact)}")
             ok(f"Movimientos cargados: {len(df_bank)}")
 
             return df_fact, df_bank
@@ -60,7 +70,7 @@ class PipelineMatcher:
             return pd.DataFrame(), pd.DataFrame()
 
     # --------------------------------------------------------
-    # AUDITORÍA OFICIAL
+    # AUDITORÍA
     # --------------------------------------------------------
     def _audit(self, evento: str, detalle: str):
         try:
@@ -75,25 +85,15 @@ class PipelineMatcher:
             warn(f"No se pudo registrar auditoría: {e}")
 
     # --------------------------------------------------------
-    # PROCESAMIENTO PRINCIPAL
+    # PROCESO PRINCIPAL
     # --------------------------------------------------------
     def run(self) -> dict:
-        """
-        Ejecuta el matching completo y devuelve:
-          - df_matches
-          - df_detalles
-        Y guarda los matches reales en BD.
-        """
         info("=== PIPELINE MATCHER · EJECUCIÓN COMPLETA ===")
 
         df_fact, df_bank = self._load_data()
 
-        if df_fact.empty:
-            warn("No hay facturas para procesar.")
-            return {}
-
-        if df_bank.empty:
-            warn("No hay movimientos bancarios para procesar.")
+        if df_fact.empty or df_bank.empty:
+            warn("No hay data suficiente para ejecutar matching.")
             return {}
 
         info("Ejecutando motor MatcherEngine…")
@@ -102,31 +102,45 @@ class PipelineMatcher:
         ok(f"Matches generados: {len(df_match)}")
         ok(f"Detalles generados: {len(df_detalles)}")
 
-        # ==========================================================
-        # 🔍 DEBUG: INSPECCIÓN DE MATCHES
-        # ==========================================================
-        print("\n===== DEBUG MATCHER COLUMNS =====")
-        print(df_match.columns.tolist())
-
-        print("\n===== DEBUG MATCHER SAMPLE =====")
-        print(df_match.head(15))
-
-        if len(df_match) > 0:
-            print("\n===== DEBUG MATCHER RAW ROW =====")
-            print(df_match.iloc[0].to_dict())
-        # ==========================================================
-
         # ----------------------------------------------------
-        # GUARDAR MATCHES REALES → BD
+        # GUARDAR MATCHES
         # ----------------------------------------------------
         if not df_match.empty:
-            info("Guardando matches reales en BD…")
             self.writer.save_many(df_match.to_dict("records"))
         else:
             warn("No se generaron matches válidos.")
 
         # ----------------------------------------------------
-        # GUARDAR DETALLES (TABLA TEMPORAL)
+        # MARCAR FACTURAS COBRADAS (🔥 CAMBIO CLAVE 🔥)
+        # ----------------------------------------------------
+        try:
+            conn = self.db.connect()
+
+            df_ok = df_match[df_match["match_tipo"] == "MATCH"]
+
+            for _, row in df_ok.iterrows():
+                factura_id = row.get("factura_id")
+                if not factura_id:
+                    continue
+
+                conn.execute(
+                    """
+                    UPDATE facturas_pf
+                    SET fue_cobrado = 1,
+                        match_id = ?
+                    WHERE id = ?
+                    """,
+                    (row.get("factura_hash"), factura_id)
+                )
+
+            conn.commit()
+            ok(f"Facturas marcadas como cobradas: {len(df_ok)}")
+
+        except Exception as e:
+            warn(f"No se pudieron actualizar facturas cobradas: {e}")
+
+        # ----------------------------------------------------
+        # GUARDAR DETALLES TEMPORALES
         # ----------------------------------------------------
         if not df_detalles.empty:
             try:
@@ -136,9 +150,9 @@ class PipelineMatcher:
                     if_exists="replace",
                     index=False
                 )
-                ok("Detalles guardados en tabla temporal match_detalles_tmp.")
+                ok("Detalles guardados en match_detalles_tmp.")
             except Exception as e:
-                warn(f"No se pudieron guardar los detalles: {e}")
+                warn(f"No se pudieron guardar detalles: {e}")
 
         # Auditoría
         self._audit("MATCH_RUN", f"Matches generados: {len(df_match)}")
@@ -152,12 +166,9 @@ class PipelineMatcher:
 
 
 # ============================================================
-# PRUEBA CONTROLADA SI SE EJECUTA DIRECTO
+# TEST LOCAL
 # ============================================================
 if __name__ == "__main__":
     info("=== TEST LOCAL · PIPELINE MATCHER ===")
-
-    pm = PipelineMatcher()
-    result = pm.run()
-
+    PipelineMatcher().run()
     ok("=== FIN TEST MATCHER ===")

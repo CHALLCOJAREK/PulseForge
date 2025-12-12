@@ -124,12 +124,14 @@ class Calculator:
                 "factura_hash": factura_hash,
                 "subtotal": row.get("subtotal"),
                 "igv": row.get("igv"),
-                "total_final": row.get("total_con_igv"),
+                "total_con_igv": row.get("total_con_igv"),
                 "detraccion": row.get("detraccion_monto"),
+                "total_sin_detraccion": row.get("neto_recibido"),
                 "dias_credito": row.get("dias_credito"),
                 "fecha_pago": fecha_pago_str,
                 "variacion": 0
             }
+
 
             try:
                 db.insert("calculos_pf", data_calc)

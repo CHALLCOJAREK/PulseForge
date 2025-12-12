@@ -60,7 +60,7 @@ class MatchWriter:
         self._bank_hash_map: Dict[Any, str] = {}
 
     # ------------------------------------------------------
-    #  Creación de tabla
+    #  Creación de tabla (segura)
     # ------------------------------------------------------
     def _ensure_table(self, conn: sqlite3.Connection) -> None:
         sql = f"""
@@ -68,6 +68,8 @@ class MatchWriter:
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
             factura_hash     TEXT,
             banco_hash       TEXT,
+            cliente_hash     TEXT,
+            tipo_monto_match TEXT,
             monto_factura    REAL,
             monto_banco      REAL,
             diferencia       REAL,
@@ -145,7 +147,6 @@ class MatchWriter:
             self._load_hash_maps(conn)
 
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
             rows_to_insert = []
 
             for _, row in df_match.iterrows():
@@ -155,8 +156,8 @@ class MatchWriter:
                 # ----------------------------
                 # HASH FACTURA
                 # ----------------------------
-                if "factura_hash" in row and pd.notna(row["factura_hash"]):
-                    factura_hash = str(row["factura_hash"])
+                if pd.notna(row.get("factura_hash")):
+                    factura_hash = str(row.get("factura_hash"))
                 elif factura_id in self._fact_hash_map:
                     factura_hash = self._fact_hash_map[factura_id]
                 else:
@@ -165,25 +166,31 @@ class MatchWriter:
                 # ----------------------------
                 # HASH BANCO
                 # ----------------------------
-                if "banco_hash" in row and pd.notna(row["banco_hash"]):
-                    banco_hash = str(row["banco_hash"])
+                if pd.notna(row.get("banco_hash")):
+                    banco_hash = str(row.get("banco_hash"))
                 elif mov_id in self._bank_hash_map:
                     banco_hash = self._bank_hash_map[mov_id]
                 else:
                     banco_hash = f"BANK:{mov_id}"
 
+                cliente_hash = row.get("cliente_hash")
+                tipo_monto_match = row.get("tipo_monto_match")
+
                 monto_factura = self._safe_float(
-                    row.get("total_con_igv")
-                    or row.get("total")
-                    or row.get("subtotal")
+                    row.get("monto_factura")
+                    or row.get("total_final")
+                    or row.get("total_con_igv")
                 )
+
                 monto_banco = self._safe_float(
                     row.get("monto_banco_equivalente")
                     or row.get("monto_banco")
                 )
+
                 diferencia = self._safe_float(
                     row.get("variacion_monto") or (monto_factura - monto_banco)
                 )
+
                 porcentaje_match = self._safe_float(row.get("score_similitud"))
                 estado = str(row.get("match_tipo") or "NO_MATCH").upper()
 
@@ -191,6 +198,8 @@ class MatchWriter:
                     (
                         factura_hash,
                         banco_hash,
+                        cliente_hash,
+                        tipo_monto_match,
                         monto_factura,
                         monto_banco,
                         diferencia,
@@ -204,13 +213,15 @@ class MatchWriter:
             INSERT INTO {MATCH_TABLE} (
                 factura_hash,
                 banco_hash,
+                cliente_hash,
+                tipo_monto_match,
                 monto_factura,
                 monto_banco,
                 diferencia,
                 porcentaje_match,
                 estado,
                 fecha_match
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
 
             conn.executemany(sql_insert, rows_to_insert)
@@ -229,7 +240,6 @@ class MatchWriter:
     #  🔄 RETROCOMPATIBILIDAD — save_many(records)
     # =======================================================
     def save_many(self, records: List[Dict[str, Any]]) -> None:
-        """Compatibilidad con pipeline antiguo (records → DataFrame)."""
         if not records:
             warn("[MatchWriter] save_many() recibió lista vacía.")
             return
@@ -240,5 +250,4 @@ class MatchWriter:
             error(f"[MatchWriter] Error convirtiendo records a DataFrame en save_many(): {e}")
             raise
 
-        # Reutiliza TODA la lógica PRO
         self.save_matches(df)
