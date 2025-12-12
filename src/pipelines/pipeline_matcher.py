@@ -43,24 +43,25 @@ class PipelineMatcher:
     # CARGA DE DATOS DESDE BD
     # --------------------------------------------------------
     def _load_data(self):
+        """Carga facturas + cálculos y bancos desde la BD PulseForge."""
         try:
             conn = self.db.connect()
 
-            df_fact = pd.read_sql_query(
-                """
-                SELECT *
-                FROM facturas_pf
-                WHERE IFNULL(fue_cobrado, 0) = 0
-                """,
-                conn
-            )
+            df_fact = pd.read_sql_query("""
+                SELECT
+                    f.*,
+                    c.total_final,
+                    c.detraccion
+                FROM facturas_pf f
+                LEFT JOIN calculos_pf c
+                    ON f.source_hash = c.factura_hash
+            """, conn)
 
             df_bank = pd.read_sql_query(
-                "SELECT * FROM bancos_pf",
-                conn
+                "SELECT * FROM bancos_pf", conn
             )
 
-            ok(f"Facturas pendientes de cobro: {len(df_fact)}")
+            ok(f"Facturas cargadas: {len(df_fact)}")
             ok(f"Movimientos cargados: {len(df_bank)}")
 
             return df_fact, df_bank
@@ -68,6 +69,7 @@ class PipelineMatcher:
         except Exception as e:
             error(f"Error cargando data desde BD: {e}")
             return pd.DataFrame(), pd.DataFrame()
+
 
     # --------------------------------------------------------
     # AUDITORÍA

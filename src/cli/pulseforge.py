@@ -111,7 +111,7 @@ def cmd_full(args):
     pm = PipelineMatcher()
     pm.run()
 
-    ok("FULL RUN completado con éxito 😎")
+    ok("RUN completado con éxito ✔")
 
 
 # ======================================================

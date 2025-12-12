@@ -103,6 +103,7 @@ class NewDBBuilder:
             igv REAL,
             total_con_igv REAL,
             detraccion REAL,
+            total_sin_detraccion REAL,
             total_final REAL,
             dias_credito INTEGER,
             fecha_pago TEXT,
